@@ -1,2 +1,2 @@
 # TerrapinPilot
-TerrapinPilot is a privacy-first local ACP server meant for agentic OpenAI-compatible local LLM execution on Macs. Written in Swift; designed primarily for Xcode, though other ACP-compliant IDEs could use this framework..
+TerrapinPilot is an agent-client protocol server for Xcode 27 that runs against any OpenAI-compatible endpoint, including local models. Build your own custom harness.
