@@ -9,7 +9,7 @@ import Foundation
 import Logger
 import Stores
 
-public actor XcodeMCPBridgeClient {
+public actor XcodeMCPBridgeClient: ToolProvider {
     private var process: Process?
     private var inputPipe: Pipe?
     private var outputPipe: Pipe?
@@ -17,6 +17,37 @@ public actor XcodeMCPBridgeClient {
     private var logger: Loggable
 
     private var activeTabIdentifier: String?
+    private var tools: [ToolDefinition] = []
+    private var openedWorkspacePath: String?
+
+    public func definitions() async -> [ToolDefinition] { tools }
+
+    public func execute(name: String, argsJSON: String, cwd: String)
+        async -> String
+    {
+        await callTool(name: name, argsJSON: argsJSON, cwd: cwd)
+    }
+
+    /// Opens the Xcode workspace for `cwd` before the agent loop so that
+    /// workspace-dependent tools (XcodeRead, ...) work on the first call and
+    /// the user's access-approval prompt appears up front instead of after a
+    /// refused read. No-op if this workspace is already open.
+    public func prepare(cwd: String) async {
+        guard !cwd.isEmpty, openedWorkspacePath != cwd else { return }
+
+        let args: [String: Any] = ["path": cwd]
+        let argsJSON =
+            (try? JSONSerialization.data(withJSONObject: args))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+
+        let result = await callTool(
+            name: "XcodeOpenWorkspace",
+            argsJSON: argsJSON,
+            cwd: cwd
+        )
+        logger.debug("XcodeOpenWorkspace(\(cwd)): \(result)")
+        openedWorkspacePath = cwd
+    }
 
     public init(_ logger: Loggable) {
         self.logger = logger
@@ -55,7 +86,7 @@ public actor XcodeMCPBridgeClient {
             "params": [
                 "protocolVersion": "2024-11-05",
                 "capabilities": [:],
-                "clientInfo": ["name": "blueacp", "version": "1.0.0"],
+                "clientInfo": ["name": "TerrapinPilot", "version": "1.0.0"],
             ],
         ]
         _ = try? sendRPC(initRequest)
@@ -69,6 +100,7 @@ public actor XcodeMCPBridgeClient {
     }
 
     /// Fetches all dynamic workspace tools provided by Xcode's mcpbridge
+    @discardableResult
     public func fetchTools() async -> [ToolDefinition] {
         let request: [String: Any] = [
             "jsonrpc": "2.0",
@@ -110,6 +142,7 @@ public actor XcodeMCPBridgeClient {
             }
         }
 
+        self.tools = tools
         return tools
     }
 
@@ -122,18 +155,24 @@ public actor XcodeMCPBridgeClient {
             (try? JSONSerialization.jsonObject(with: argsData) as? [String: Any])
             ?? [:]
 
-        // 1. Auto-inject cached tabIdentifier if available and missing from LLM arguments
-        if argsDict["tabIdentifier"] == nil, let cachedTab = activeTabIdentifier
-        {
-            argsDict["tabIdentifier"] = cachedTab
-        }
+    // 1. Auto-inject cached tabIdentifier if available and missing from LLM arguments
+    if argsDict["tabIdentifier"] == nil, let cachedTab = activeTabIdentifier
+    {
+        argsDict["tabIdentifier"] = cachedTab
+    }
 
-        // Send initial RPC tool call request
+    // 2. Auto-inject workspaceIdentifier (the project directory) if missing,
+    //    since Xcode workspace tools require it to resolve the target project.
+    if argsDict["workspaceIdentifier"] == nil, !cwd.isEmpty {
+        argsDict["workspaceIdentifier"] = cwd
+    }
+
+    // Send initial RPC tool call request
         let response = sendToolRPC(name: name, argsDict: argsDict)
         let outputText = parseToolOutput(response: response, name: name)
 
-        // 2. Check if mcpbridge threw a tabIdentifier required error
-        if outputText.contains("tabIdentifier is required for this action") {
+    // 3. Check if mcpbridge threw a tabIdentifier required error
+    if outputText.contains("tabIdentifier is required for this action") {
             if let matchedTab = parseTabIdentifier(
                 from: outputText,
                 matchingCWD: cwd

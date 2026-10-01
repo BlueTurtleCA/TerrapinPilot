@@ -8,7 +8,7 @@
 import os
 
 public struct OSLogger: Loggable, Sendable {
-    let sharedLogger = os.Logger(subsystem: "ca.blueturtle.blueacp", category: "ACP")
+    let sharedLogger = os.Logger(subsystem: "ca.blueturtle.terrapinpilot", category: "ACP")
     
     public init() {}
     

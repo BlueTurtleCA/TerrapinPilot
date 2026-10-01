@@ -10,6 +10,10 @@ import Foundation
 public struct ChatMessage: Codable, Sendable {
     public var role: String
     public var content: String?
+    /// The model's reasoning/thinking for this turn. Sent back to the server
+    /// as `reasoning_content` so reasoning-preserving chat templates (Qwen3)
+    /// render it identically, keeping the prompt prefix stable for KV reuse.
+    public var reasoning: String?
     public var toolCallId: String?
     public var name: String?
     public var toolCalls: [ToolCall]?
@@ -17,6 +21,7 @@ public struct ChatMessage: Codable, Sendable {
     enum CodingKeys: String, CodingKey {
         case role
         case content
+        case reasoning = "reasoning_content"
         case toolCallId = "tool_call_id"
         case name
         case toolCalls = "tool_calls"
@@ -25,12 +30,14 @@ public struct ChatMessage: Codable, Sendable {
     public init(
         role: String,
         content: String? = nil,
+        reasoning: String? = nil,
         toolCallId: String? = nil,
         name: String? = nil,
         toolCalls: [ToolCall]? = nil
     ) {
         self.role = role
         self.content = content
+        self.reasoning = reasoning
         self.toolCallId = toolCallId
         self.name = name
         self.toolCalls = toolCalls

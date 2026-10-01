@@ -8,10 +8,12 @@
 import Foundation
 import Stores
 
-public enum WebTools {
-    
-    // MARK: - Tool Definitions for OpenAI / MLX Schema
-    
+public struct WebTools: ToolProvider {
+
+    public init() {}
+
+    // MARK: - Tool Definitions for OpenAI / AI Server Schema
+
     public static let definitions: [ToolDefinition] = [
         ToolDefinition(
             function: FunctionDefinition(
@@ -47,8 +49,16 @@ public enum WebTools {
         )
     ]
     
+    // MARK: - ToolProvider Conformance
+
+    public func definitions() async -> [ToolDefinition] { Self.definitions }
+
+    public func execute(name: String, argsJSON: String, cwd: String) async -> String {
+        await Self.execute(name: name, argsJSON: argsJSON)
+    }
+
     // MARK: - Execution Dispatcher
-    
+
     public static func execute(name: String, argsJSON: String) async -> String {
         guard let data = argsJSON.data(using: .utf8),
               let args = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {

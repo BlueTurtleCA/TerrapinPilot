@@ -15,6 +15,7 @@ public struct ContextManager {
         var totalChars = 0
         for msg in history {
             totalChars += msg.content?.count ?? 0
+            totalChars += msg.reasoning?.count ?? 0
             if let toolCalls = msg.toolCalls {
                 for call in toolCalls {
                     totalChars +=
@@ -29,7 +30,7 @@ public struct ContextManager {
     public static func compactHistory(
         _ history: [ChatMessage],
         maxTokens: Int = 16384,  // Set to your model's context size (e.g. 8192, 16384, 32768)
-        targetBudgetRatio: Double = 0.70  // Compact when usage exceeds 70% of max context
+        targetBudgetRatio: Double = 0.90  // Compact when usage exceeds 90% of max context
     ) -> [ChatMessage] {
         let currentTokens = estimateTokenCount(history)
         let tokenLimit = Int(Double(maxTokens) * targetBudgetRatio)
@@ -62,9 +63,20 @@ public struct ContextManager {
             )
         )
 
-        // Keep the most recent messages (e.g. last 12 messages)
-        let keepCount = min(12, history.count - 1)
-        var recentMessages = Array(history.suffix(keepCount))
+        // Keep the most recent messages that fit within a token budget, so a
+        // single huge tool result can't blow the window and small turns keep
+        // more context than a fixed message count would allow.
+        let keepBudget = Int(Double(maxTokens) * 0.50)
+        var recentMessages: [ChatMessage] = []
+        var usedTokens = 0
+        for message in history.reversed() {
+            let messageTokens = estimateTokenCount([message])
+            if !recentMessages.isEmpty, usedTokens + messageTokens > keepBudget {
+                break
+            }
+            recentMessages.insert(message, at: 0)
+            usedTokens += messageTokens
+        }
 
         // Ensure we don't start recent history with an orphaned tool response
         while let first = recentMessages.first, first.role == "tool" {
@@ -75,7 +87,7 @@ public struct ContextManager {
         return compacted
     }
 
-    /// Queries LM Studio's server endpoints to retrieve the loaded model's context window
+    /// Queries the AI server's endpoints to retrieve the loaded model's context window
     public static func resolveContextWindow(
         _ endpoint: String
     ) async -> Int {
@@ -96,12 +108,39 @@ public struct ContextManager {
                 continue
             }
 
-            // 1. Check direct LM Studio property
+            // llama.cpp reports the context length inside a "meta" object, and
+            // the exact key varies by version:
+            //   new: data[0].meta.n_ctx
+            //   old: data[0].meta.model_info.context_length
+            // Check "meta" first so we don't silently fall back to 16384 (which
+            // would make compaction fire every turn and destroy KV prefix reuse).
+            if let meta = activeModel["meta"] as? [String: Any] {
+                if let ctxLen = meta["n_ctx"] as? Int {
+                    return ctxLen
+                }
+                if let modelInfo = meta["model_info"] as? [String: Any],
+                    let ctxLen = modelInfo["context_length"] as? Int
+                {
+                    return ctxLen
+                }
+                if let ctxLen = meta["context_length"] as? Int {
+                    return ctxLen
+                }
+            }
+
+            // 1. Check direct server property
             if let maxCtx = activeModel["max_context_length"] as? Int {
                 return maxCtx
             }
 
-            // 2. Check active instance config (LM Studio v1 REST API)
+            // 2. Some servers expose model_info at the top level
+            if let modelInfo = activeModel["model_info"] as? [String: Any],
+                let ctxLen = modelInfo["context_length"] as? Int
+            {
+                return ctxLen
+            }
+
+            // 3. Check active instance config (v1 REST API)
             if let instances = activeModel["loaded_instances"]
                 as? [[String: Any]],
                 let config = instances.first?["config"] as? [String: Any],
@@ -110,7 +149,7 @@ public struct ContextManager {
                 return ctxLen
             }
 
-            // 3. Check standard fallback property
+            // 4. Check standard fallback property
             if let ctxLen = activeModel["context_length"] as? Int {
                 return ctxLen
             }

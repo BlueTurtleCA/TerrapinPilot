@@ -7,7 +7,7 @@
 
 import Foundation
 
-// MARK: - OpenAI / MLX Compatible Tool Models
+// MARK: - OpenAI / AI Server Compatible Tool Models
 
 public struct ToolDefinition: Codable, Sendable {
     public let type: String

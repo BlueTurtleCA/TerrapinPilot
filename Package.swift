@@ -26,9 +26,16 @@ let package = Package(
             name: "Tools",
             dependencies: ["Logger", "Stores"]
         ),
+        .target(
+            name: "Agent",
+            dependencies: ["Logger", "Stores", "Helpers", "Tools"]
+        ),
         .executableTarget(
             name: "CLI",
-            dependencies: ["Logger", "Stores", "Tools", "Enums", "Helpers"]
+            dependencies: ["Logger", "Stores", "Tools", "Enums", "Helpers", "Agent"],
+            resources: [
+                .process("Resources/system_prompt.txt")
+            ]
         ),
     ]
 )
