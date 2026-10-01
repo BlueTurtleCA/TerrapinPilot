@@ -104,9 +104,9 @@ TerrapinPilot reads one JSON-RPC message per line from `stdin` and writes JSON-R
 - **`web_fetch`** — fetches an HTTP/HTTPS URL and returns its text content.
 - **`web_search`** — searches the live web (Tavily or DuckDuckGo).
 
-## Testing Terrapin
+## Testing TerrapinPilot
 
-To test that Terrapin can successfully connect with the AI server, enter the following via stdin:
+To test that TerrapinPilot can successfully connect with the AI server, enter the following via stdin:
 
 ```
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
