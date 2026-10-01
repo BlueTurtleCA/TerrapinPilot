@@ -63,9 +63,9 @@ public struct OpenAICompatibleClient: LLMClient {
             )
         )
 
-        //if let debugLogDirectory {
+        if let debugLogDirectory {
             Self.writeDebugLog(request.httpBody!, to: URL(string: "/tmp")!)
-        //}
+        }
 
         let (bytes, response) = try await session.bytes(for: request)
 
