@@ -17,15 +17,60 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private var logger: Loggable
 
     private var activeTabIdentifier: String?
+    private var activeWorkspaceIdentifier: String?
     private var tools: [ToolDefinition] = []
     private var openedWorkspacePath: String?
 
     public func definitions() async -> [ToolDefinition] { tools }
 
-    public func execute(name: String, argsJSON: String, cwd: String)
+    private let allowedMCPBridgeTools: Set<String> = [
+        "BuildProject",
+        "GetBuildLog",
+        "XcodeListNavigatorIssues",
+        "RunSomeTests",
+        "RunAllTests",
+        "RenderPreview",
+        "DocumentationSearch"
+    ]
+    
+    public func execute(name: String, argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void)
         async -> String
     {
-        await callTool(name: name, argsJSON: argsJSON, cwd: cwd)
+        let callId = "call_" + UUID().uuidString
+        let (kind, title) = categorizeMCPTool(name: name, argsJSON: argsJSON)
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": callId,
+                    "name": name,
+                    "title": title,
+                    "kind": kind,
+                    "status": "in_progress"
+                ]
+            ]
+        ])
+        
+        let result = await callTool(name: name, argsJSON: argsJSON, cwd: cwd)
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": result.starts(with: "Error") ? "failed" : "completed"
+                ]
+            ]
+        ])
+        
+        return result
     }
 
     /// Opens the Xcode workspace for `cwd` before the agent loop so that
@@ -47,6 +92,15 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         )
         logger.debug("XcodeOpenWorkspace(\(cwd)): \(result)")
         openedWorkspacePath = cwd
+
+        // The bridge identifies workspaces by an opaque identifier (e.g.
+        // "workspace-LR49lofe9w"), not by path, so capture it from the open
+        // response and fall back to listing workspaces if it is missing.
+        if let identifier = parseWorkspaceIdentifier(from: result) {
+            activeWorkspaceIdentifier = identifier
+        } else {
+            activeWorkspaceIdentifier = await resolveWorkspaceIdentifier(matchingCWD: cwd)
+        }
     }
 
     public init(_ logger: Loggable) {
@@ -118,6 +172,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         var tools: [ToolDefinition] = []
         for toolDict in toolsArray {
             guard let name = toolDict["name"] as? String,
+                allowedMCPBridgeTools.contains(name),
                 let description = toolDict["description"] as? String,
                 let inputSchema = toolDict["inputSchema"] as? [String: Any]
             else { continue }
@@ -155,24 +210,29 @@ public actor XcodeMCPBridgeClient: ToolProvider {
             (try? JSONSerialization.jsonObject(with: argsData) as? [String: Any])
             ?? [:]
 
-    // 1. Auto-inject cached tabIdentifier if available and missing from LLM arguments
-    if argsDict["tabIdentifier"] == nil, let cachedTab = activeTabIdentifier
-    {
-        argsDict["tabIdentifier"] = cachedTab
-    }
+        // 1. Auto-inject cached tabIdentifier if available and missing from LLM arguments
+        if argsDict["tabIdentifier"] == nil, let cachedTab = activeTabIdentifier
+        {
+            argsDict["tabIdentifier"] = cachedTab
+        }
 
-    // 2. Auto-inject workspaceIdentifier (the project directory) if missing,
-    //    since Xcode workspace tools require it to resolve the target project.
-    if argsDict["workspaceIdentifier"] == nil, !cwd.isEmpty {
-        argsDict["workspaceIdentifier"] = cwd
-    }
-
-    // Send initial RPC tool call request
+        // 2. Auto-inject the cached workspace identifier if missing, since Xcode
+        //    workspace tools require it to resolve the target project. Fall back
+        //    to the project directory for bridges that accept paths.
+        if argsDict["workspaceIdentifier"] == nil {
+            if let cachedWorkspace = activeWorkspaceIdentifier {
+                argsDict["workspaceIdentifier"] = cachedWorkspace
+            } else if !cwd.isEmpty {
+                argsDict["workspaceIdentifier"] = cwd
+            }
+        }
+                
+        // Send initial RPC tool call request
         let response = sendToolRPC(name: name, argsDict: argsDict)
         let outputText = parseToolOutput(response: response, name: name)
 
-    // 3. Check if mcpbridge threw a tabIdentifier required error
-    if outputText.contains("tabIdentifier is required for this action") {
+        // 3. Check if mcpbridge threw a tabIdentifier required error
+        if outputText.contains("tabIdentifier is required for this action") {
             if let matchedTab = parseTabIdentifier(
                 from: outputText,
                 matchingCWD: cwd
@@ -182,6 +242,19 @@ public actor XcodeMCPBridgeClient: ToolProvider {
 
                 // Re-inject tabIdentifier and retry immediately
                 argsDict["tabIdentifier"] = matchedTab
+                let retryResponse = sendToolRPC(name: name, argsDict: argsDict)
+                return parseToolOutput(response: retryResponse, name: name)
+            }
+        }
+
+        // 4. If the bridge rejects the injected workspace identifier, resolve
+        //    the correct one from XcodeListWorkspaces and retry once.
+        if name != "XcodeListWorkspaces",
+            outputText.contains("Unknown workspace identifier")
+        {
+            if let resolved = await resolveWorkspaceIdentifier(matchingCWD: cwd) {
+                activeWorkspaceIdentifier = resolved
+                argsDict["workspaceIdentifier"] = resolved
                 let retryResponse = sendToolRPC(name: name, argsDict: argsDict)
                 return parseToolOutput(response: retryResponse, name: name)
             }
@@ -275,6 +348,53 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         return matches.first?.tab
     }
 
+    /// Extracts the `workspaceIdentifier` field from an XcodeOpenWorkspace
+    /// response, e.g. `{"workspaceIdentifier":"workspace-LR49lofe9w", ...}`.
+    private func parseWorkspaceIdentifier(from text: String) -> String? {
+        guard let data = text.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let identifier = json["workspaceIdentifier"] as? String,
+            !identifier.isEmpty
+        else { return nil }
+        return identifier
+    }
+
+    /// Lists open workspaces and returns the identifier whose `workspacePath`
+    /// matches `cwd`. When a project appears as both a workspace and a window
+    /// tab, the workspace-level identifier is preferred.
+    private func resolveWorkspaceIdentifier(matchingCWD cwd: String) async -> String? {
+        let result = await callTool(name: "XcodeListWorkspaces", argsJSON: "{}", cwd: cwd)
+        logger.debug("XcodeListWorkspaces: \(result)")
+
+        var fallback: String?
+        for line in result.components(separatedBy: .newlines)
+        where line.contains("workspaceIdentifier:") && line.contains("workspacePath:")
+        {
+            var identifier = ""
+            var path = ""
+            for part in line.components(separatedBy: ",") {
+                let trimmed = part.trimmingCharacters(in: .whitespaces)
+                if trimmed.contains("workspaceIdentifier:") {
+                    identifier = trimmed
+                        .replacingOccurrences(of: "workspaceIdentifier:", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                } else if trimmed.contains("workspacePath:") {
+                    path = trimmed
+                        .replacingOccurrences(of: "workspacePath:", with: "")
+                        .trimmingCharacters(in: .whitespaces)
+                }
+            }
+            guard !identifier.isEmpty, !path.isEmpty else { continue }
+            if path == cwd || cwd.hasPrefix(path) || path.hasPrefix(cwd) {
+                if identifier.hasPrefix("workspace-") {
+                    return identifier
+                }
+                fallback = identifier
+            }
+        }
+        return fallback
+    }
+
     // MARK: - Low-Level Line-Buffered JSON-RPC Transport
 
     private func sendNotification(_ json: [String: Any]) throws {
@@ -319,6 +439,25 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         return nil
     }
 
+    private func categorizeMCPTool(name: String, argsJSON: String) -> (kind: String, title: String) {
+        switch name {
+        case "BuildProject":
+            return ("execute", "Building Project")
+        case "XcodeClean":
+            return ("execute", "Cleaning Build Folder")
+        case "RunSomeTests", "RunAllTests":
+            return ("execute", "Running Unit Tests")
+        case "DocumentationSearch":
+            return ("search", "Searching Apple Documentation")
+        case "GetBuildLog", "XcodeListNavigatorIssues":
+            return ("search", "Fetching Xcode Diagnostics")
+        case "RenderPreview":
+            return ("fetch", "Rendering SwiftUI Preview")
+        default:
+            return ("execute", "Running \(name)")
+        }
+    }
+    
     deinit {
         process?.terminate()
     }

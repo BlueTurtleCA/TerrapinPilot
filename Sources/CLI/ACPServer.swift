@@ -17,19 +17,50 @@ final class ACPServer: Sendable {
     private let agent: Agent
     private let sessionStore: SessionStore
     private let tools: [ToolDefinition]
+    private let toolRegistry: ToolRegistry
+    private let xcodeBridge: XcodeMCPBridgeClient
+    private let defaultClient: ClientKind
     private let logger: Loggable
+    private let clientChannel: ClientChannel
+    private let clientTools: ACPWrapperTools
     private let stdoutLock = NSLock()
+    // In-flight session/prompt tasks, keyed by session id. Guarded by
+    // taskLock so session/cancel can find and stop the running turn.
+    private let taskLock = NSLock()
+    private nonisolated(unsafe) var promptTasks: [String: PromptTaskBox] = [:]
+    // Written once in handleInitialize (the first message the client sends)
+    // and only read afterwards, so no locking is needed.
+    private nonisolated(unsafe) var clientKind: ClientKind = .xcode
+    // Set once when the Xcode MCP bridge is started; the stdin loop is
+    // sequential, so no locking is needed.
+    private nonisolated(unsafe) var xcodeBridgeReady = false
 
     init(
         agent: Agent,
         sessionStore: SessionStore,
         tools: [ToolDefinition],
+        toolRegistry: ToolRegistry,
+        xcodeBridge: XcodeMCPBridgeClient,
+        clientChannel: ClientChannel,
+        clientTools: ACPWrapperTools,
+        defaultClient: ClientKind,
         logger: Loggable
     ) {
         self.agent = agent
         self.sessionStore = sessionStore
         self.tools = tools
+        self.toolRegistry = toolRegistry
+        self.xcodeBridge = xcodeBridge
+        self.defaultClient = defaultClient
         self.logger = logger
+        self.clientChannel = clientChannel
+        self.clientTools = clientTools
+        self.clientKind = defaultClient
+
+        // Deliver agent-initiated client requests (fs/*, terminal/*) to stdout.
+        clientChannel.setSender { [weak self] json in
+            self?.sendJSON(json)
+        }
     }
 
     /// Runs the stdin read/parse/dispatch loop until stdin closes.
@@ -58,15 +89,26 @@ final class ACPServer: Sendable {
         let reqId: String? =
             (json["id"] as? String) ?? (json["id"] as? Int).map(String.init)
 
+        // A message with no method but an id is a response to a request the
+        // agent sent to the client (fs/*, terminal/*). Route it to the
+        // awaiting ClientChannel caller.
+        if method.isEmpty, hasId {
+            let answered = await clientChannel.handleIncoming(json)
+            if !answered {
+                logger.debug("Unmatched client response id: \(reqId ?? "?")")
+            }
+            return
+        }
+
         switch method {
         case "initialize":
-            handleInitialize(hasId: hasId, reqId: reqId)
+            handleInitialize(json: json, hasId: hasId, reqId: reqId)
         case "session/new":
             await handleNewSession(json: json, hasId: hasId, reqId: reqId)
         case "session/prompt":
             await handlePrompt(json: json, hasId: hasId, reqId: reqId)
         case "session/cancel":
-            handleCancel(hasId: hasId, reqId: reqId)
+            handleCancel(json: json)
         default:
             if hasId, let reqId {
                 sendJSON([
@@ -78,8 +120,33 @@ final class ACPServer: Sendable {
         }
     }
 
-    private func handleInitialize(hasId: Bool, reqId: String?) {
+    private func handleInitialize(json: [String: Any], hasId: Bool, reqId: String?) {
         guard hasId, let reqId else { return }
+
+        // Negotiate the client capabilities that gate the native ACP tools
+        // (fs/* and terminal/*). Omitted capabilities are unsupported.
+        let params = json["params"] as? [String: Any]
+        let clientCapabilities = params?["clientCapabilities"] as? [String: Any]
+        let fs = clientCapabilities?["fs"] as? [String: Any]
+        clientTools.updateCapabilities(
+            Capabilities(
+                readTextFile: (fs?["readTextFile"] as? Bool) ?? false,
+                writeTextFile: (fs?["writeTextFile"] as? Bool) ?? false,
+                terminal: (clientCapabilities?["terminal"] as? Bool) ?? false
+            )
+        )
+
+        // Identify the connecting client (clientInfo is SHOULD-level in the
+        // ACP spec) so the agent can pick the matching system prompt and
+        // toolset.
+        let clientInfo = params?["clientInfo"] as? [String: Any]
+        clientKind = ClientKind.detect(
+            clientInfo: clientInfo,
+            environment: ProcessInfo.processInfo.environment,
+            fallback: defaultClient
+        )
+        logger.debug("Detected ACP client: \(clientKind)")
+
         sendJSON([
             "jsonrpc": "2.0",
             "id": reqId,
@@ -106,11 +173,33 @@ final class ACPServer: Sendable {
             await sessionStore.setCWD(cwd, for: newSessionId)
         }
 
+        // Xcode-only setup: spawn the mcpbridge and register its tools the
+        // first time an Xcode session is created.
+        if clientKind == .xcode, !xcodeBridgeReady {
+            xcodeBridgeReady = true
+            await setupXcodeBridge()
+        }
+
         sendJSON([
             "jsonrpc": "2.0",
             "id": reqId,
             "result": ["sessionId": newSessionId],
         ])
+    }
+
+    /// Spawns the Xcode MCP bridge and registers its tools with the registry.
+    /// Failures are logged and swallowed so the agent degrades to the
+    /// client-agnostic toolset instead of crashing.
+    private func setupXcodeBridge() async {
+        do {
+            try await xcodeBridge.start()
+        } catch {
+            logger.debug("Xcode MCP bridge failed to start: \(error)")
+            return
+        }
+        let bridgeTools = await xcodeBridge.fetchTools()
+        toolRegistry.add(xcodeBridge)
+        logger.debug("Xcode MCP bridge ready with \(bridgeTools.count) tools")
     }
 
     private func handlePrompt(
@@ -128,38 +217,72 @@ final class ACPServer: Sendable {
             await sessionStore.getCWD(for: sessionId)
             ?? Self.extractParam(params, key: "cwd")
 
-        Task.detached {
+        // Merge the negotiated client tools (fs/*, terminal/*) into this
+        // prompt's tool list so the model can call them this turn.
+        var promptTools = self.tools
+        promptTools.append(contentsOf: await self.clientTools.definitions())
+
+        let box = PromptTaskBox()
+        let task = Task.detached {
             await self.agent.run(
                 prompt: userPrompt,
                 sessionId: sessionId,
                 cwd: cwd,
-                tools: self.tools,
+                client: self.clientKind,
+                tools: promptTools,
                 onChunk: { text in
                     self.sendChunk(sessionId: sessionId, text: text)
                 },
                 onThought: { text in
                     self.sendThoughtChunk(sessionId: sessionId, text: text)
+                },
+                onSendJSON: { json in
+                    self.sendJSON(json)
                 }
             )
 
-            // Complete the ACP prompt request
+            // Complete the ACP prompt request. Per the ACP spec, a turn
+            // stopped by session/cancel reports "cancelled" here; the
+            // cancel notification itself gets no response.
+            let stopReason = Task.isCancelled ? "cancelled" : "end_turn"
             self.sendJSON([
                 "jsonrpc": "2.0",
                 "id": reqId,
                 "result": [
-                    "stopReason": "end_turn"
+                    "stopReason": stopReason
                 ],
             ])
+
+            self.removePromptTask(box, for: sessionId)
+        }
+        box.task = task
+
+        taskLock.withLock {
+            // A new prompt supersedes any in-flight turn for this session.
+            promptTasks[sessionId]?.task?.cancel()
+            promptTasks[sessionId] = box
         }
     }
 
-    private func handleCancel(hasId: Bool, reqId: String?) {
-        guard hasId, let reqId else { return }
-        sendJSON([
-            "jsonrpc": "2.0",
-            "id": reqId,
-            "result": ["stopReason": "cancelled"],
-        ])
+    /// Handles the session/cancel notification: stops the in-flight prompt
+    /// turn for the session. Sends no response (it is a notification); the
+    /// original session/prompt request is answered with "cancelled".
+    private func handleCancel(json: [String: Any]) {
+        let params = json["params"] as? [String: Any]
+        let sessionId = params?["sessionId"] as? String ?? ""
+
+        taskLock.withLock {
+            promptTasks[sessionId]?.task?.cancel()
+        }
+    }
+
+    private func removePromptTask(_ box: PromptTaskBox, for sessionId: String) {
+        taskLock.withLock {
+            // Only remove if this box is still the current one for the session.
+            if promptTasks[sessionId] === box {
+                promptTasks[sessionId] = nil
+            }
+        }
     }
 
     // MARK: - Output
@@ -223,4 +346,12 @@ final class ACPServer: Sendable {
         }
         return ""
     }
+}
+
+/// Reference wrapper around an in-flight prompt task so it can be compared
+/// by identity (Task is a struct) and captured before the task exists.
+/// The `task` slot is written once, before the task can observe the box,
+/// and only read under ACPServer's taskLock.
+private final class PromptTaskBox: @unchecked Sendable {
+    var task: Task<Void, Never>?
 }

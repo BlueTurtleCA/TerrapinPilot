@@ -64,6 +64,7 @@ TerrapinPilot is configured with CLI arguments, which take precedence over envir
 | `--context-window` | `AI_CONTEXT_WINDOW` | auto-detected | Override the context window size (in tokens). By default it is read from the server's `/v1/models` endpoint. |
 | `--slots` | `AI_SLOTS` | `1` | Number of server-side context slots (llama.cpp `-np` / `n_parallel`). Sessions are pinned to a slot so the KV cache is reused across turns. |
 | `--debug-log` | `AI_DEBUG_LOG` | `false` | Write each request body to `/tmp/terrapinpilot-llm/NNNN.json` for prefix-stability debugging. |
+| `--default-client` | `AI_DEFAULT_CLIENT` | `xcode` | Client assumed when the connecting ACP client does not identify itself (`xcode` or `generic`). |
 
 One additional, optional variable:
 
@@ -98,6 +99,10 @@ TerrapinPilot reads one JSON-RPC message per line from `stdin` and writes JSON-R
 | `session/prompt` | Runs an agent turn, streaming `session/update` notifications (`agent_message_chunk`, `agent_thought_chunk`), then returns `stopReason: end_turn`. |
 | `session/cancel` | Returns `stopReason: cancelled`. |
 
+### Client detection
+
+On `initialize`, TerrapinPilot reads the client's `clientInfo` (name/title) to identify the connecting client. Xcode gets the Xcode-specific system prompt and the `xcrun mcpbridge` toolset (spawned lazily on the first `session/new`); any other ACP client (VS Code, Zed, JetBrains, ...) gets a generic prompt and the client-agnostic tools (native ACP file tools + web tools). When a client does not identify itself, `--default-client` decides.
+
 ## Tools
 
 - **Xcode MCP tools** — discovered at runtime from `xcrun mcpbridge` (read, edit, build, test, debug, previews, and more). TerrapinPilot auto-injects the `workspaceIdentifier` and `tabIdentifier` so the model does not have to supply them.
@@ -131,7 +136,8 @@ TerrapinPilot/
     │   ├── ACPServer.swift              # ACP JSON-RPC server over stdin/stdout
     │   ├── Config.swift                 # CLI args + env var configuration
     │   └── Resources/
-    │       └── system_prompt.txt        # Bundled system prompt template
+    │       ├── system_prompt_xcode.txt  # Xcode-specific system prompt template
+    │       └── system_prompt_generic.txt# Generic (non-Xcode) system prompt template
     ├── Enums/
     │   └── MCPError.swift
     ├── Helpers/
@@ -142,6 +148,7 @@ TerrapinPilot/
     │   └── ConsoleLogger.swift          # stderr implementation
     ├── Stores/
     │   ├── ChatMessage.swift            # Chat message + tool-call models
+    │   ├── ClientKind.swift             # ACP client detection (Xcode vs. generic)
     │   ├── SessionStore.swift           # Per-session history + working directory
     │   └── ToolDefinition.swift         # OpenAI-compatible tool schema models
     └── Tools/

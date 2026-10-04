@@ -53,8 +53,48 @@ public struct WebTools: ToolProvider {
 
     public func definitions() async -> [ToolDefinition] { Self.definitions }
 
-    public func execute(name: String, argsJSON: String, cwd: String) async -> String {
-        await Self.execute(name: name, argsJSON: argsJSON)
+    public func execute(name: String, argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let data = argsJSON.data(using: .utf8),
+              let args = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            return "Error: Invalid JSON parameters supplied to \(name)"
+        }
+        
+        let callId = UUID().uuidString
+        
+        let info = args["url"] != nil ? args["url"] as! String : args["query"] as! String
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": callId,
+                    "name": name,
+                    "title": "Fetching \(info)",
+                    "kind": "fetch",
+                    "status": "in_progress"
+                ]
+            ]
+        ])
+        
+        let response = await Self.execute(name: name, argsJSON: argsJSON)
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": "completed"
+                ]
+            ]
+        ])
+        
+        return response
     }
 
     // MARK: - Execution Dispatcher

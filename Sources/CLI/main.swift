@@ -6,7 +6,6 @@
 //
 
 import Agent
-import Enums
 import Foundation
 import Helpers
 import Logger
@@ -19,17 +18,16 @@ let config = Config.load()
 let logger = OSLogger()
 let sessionStore = SessionStore()
 
-// 2. Initialize and start the native Xcode MCP bridge client
+// 2. Create the native Xcode MCP bridge client. It is started lazily by the
+//    ACP server once the connecting client identifies itself as Xcode.
 let mcpClient = XcodeMCPBridgeClient(logger)
-do {
-    try await mcpClient.start()
-} catch {
-    throw MCPError.failedToInitialize(error)
-}
 
-// 3. Register all tool providers (Xcode MCP tools + built-in web tools)
-await mcpClient.fetchTools()
-let toolRegistry = ToolRegistry([mcpClient, WebTools()])
+// 3. Register the client-agnostic tool providers (built-in web tools +
+//    native ACP client tools). The Xcode MCP bridge is added to the registry
+//    by the ACP server after client detection.
+let clientChannel = ClientChannel()
+let clientTools = ACPWrapperTools(clientChannel: clientChannel)
+let toolRegistry = ToolRegistry([WebTools(), clientTools])
 let allTools = await toolRegistry.definitions()
 
 let contextWindow: Int
@@ -55,7 +53,7 @@ let agent = Agent(
     toolRegistry: toolRegistry,
     sessionStore: sessionStore,
     contextWindow: contextWindow,
-    systemPromptTemplate: loadSystemPromptTemplate(),
+    systemPromptTemplates: loadSystemPromptTemplates(),
     logger: logger,
     slotCount: config.slots
 )
@@ -65,20 +63,32 @@ let server = ACPServer(
     agent: agent,
     sessionStore: sessionStore,
     tools: allTools,
+    toolRegistry: toolRegistry,
+    xcodeBridge: mcpClient,
+    clientChannel: clientChannel,
+    clientTools: clientTools,
+    defaultClient: config.defaultClient,
     logger: logger
 )
 logger.debug("=== Swift ACP Agent Started with Tool Calling ===")
 await server.run()
 
-// MARK: - System Prompt Template
+// MARK: - System Prompt Templates
 
-/// Loads the bundled system prompt template from the compiled resources.
-func loadSystemPromptTemplate() -> String {
-    guard
-        let url = Bundle.module.url(forResource: "system_prompt", withExtension: "txt"),
-        let contents = try? String(contentsOf: url, encoding: .utf8)
-    else {
-        fatalError("Failed to load bundled system prompt template")
+/// Loads the bundled system prompt templates (one per client kind) from the
+/// compiled resources.
+func loadSystemPromptTemplates() -> [ClientKind: String] {
+    func load(_ name: String) -> String {
+        guard
+            let url = Bundle.module.url(forResource: name, withExtension: "txt"),
+            let contents = try? String(contentsOf: url, encoding: .utf8)
+        else {
+            fatalError("Failed to load bundled system prompt template \(name).txt")
+        }
+        return contents
     }
-    return contents
+    return [
+        .xcode: load("system_prompt_xcode"),
+        .generic(name: "unknown"): load("system_prompt_generic"),
+    ]
 }

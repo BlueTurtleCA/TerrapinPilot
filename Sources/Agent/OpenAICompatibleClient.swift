@@ -63,11 +63,18 @@ public struct OpenAICompatibleClient: LLMClient {
             )
         )
 
-        if let debugLogDirectory {
-            Self.writeDebugLog(request.httpBody!, to: URL(string: "/tmp")!)
+        if debugLog {
+            Self.writeDebugLog(request.httpBody!, to: debugLogDirectory!)
         }
 
-        let (bytes, response) = try await session.bytes(for: request)
+        let (bytes, response): (URLSession.AsyncBytes, URLResponse)
+        do {
+            (bytes, response) = try await session.bytes(for: request)
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            // Task was cancelled (session/cancel); surface it as such so the
+            // agent stops quietly instead of reporting a dropped connection.
+            throw CancellationError()
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw LLMError.badResponse
@@ -116,6 +123,8 @@ public struct OpenAICompatibleClient: LLMClient {
                     toolCallFragments[index] = accumulated
                 }
             }
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            throw CancellationError()
         } catch is URLError {
             throw LLMError.streamInterrupted
         }

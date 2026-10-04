@@ -34,7 +34,8 @@ let package = Package(
             name: "CLI",
             dependencies: ["Logger", "Stores", "Tools", "Enums", "Helpers", "Agent"],
             resources: [
-                .process("Resources/system_prompt.txt")
+                .process("Resources/system_prompt_xcode.txt"),
+                .process("Resources/system_prompt_generic.txt")
             ]
         ),
     ]

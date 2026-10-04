@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Stores
 
 /// Runtime configuration sourced from CLI arguments (which take precedence)
 /// and environment variables.
@@ -19,6 +20,9 @@ struct Config: Sendable {
     /// When true, each request body sent to the AI server is written to
     /// /tmp/terrapinpilot-llm/NNNN.json for prefix-stability debugging.
     let debugLog: Bool
+    /// Client assumed when the connecting ACP client does not identify
+    /// itself via `clientInfo` in the `initialize` request.
+    let defaultClient: ClientKind
 
     /// The OpenAI-compatible chat completions endpoint derived from the server base URL.
     var chatCompletionsURL: URL {
@@ -53,6 +57,15 @@ struct Config: Sendable {
                 return v == "1" || v == "true" || v == "yes"
             }
             ?? false
+        let defaultClient =
+            (argValue("--default-client", in: args)
+                ?? env["AI_DEFAULT_CLIENT"])
+            .map {
+                $0.lowercased() == "generic"
+                    ? ClientKind.generic(name: "unknown")
+                    : ClientKind.xcode
+            }
+            ?? .xcode
 
         guard let serverURL = URL(string: serverURLString) else {
             fatalError("Invalid AI server URL: \(serverURLString)")
@@ -63,7 +76,8 @@ struct Config: Sendable {
             model: model,
             contextWindowOverride: contextWindowOverride,
             slots: slots,
-            debugLog: debugLog
+            debugLog: debugLog,
+            defaultClient: defaultClient
         )
     }
 

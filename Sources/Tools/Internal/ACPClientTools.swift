@@ -13,23 +13,6 @@ import Stores
 /// (`terminal/*`). These run inside the client (Xcode) and are preferred
 /// over the Xcode MCP bridge for file I/O and shell commands.
 public final class ACPClientTools: ToolProvider, @unchecked Sendable {
-    /// The client capabilities negotiated during `initialize`.
-    public struct Capabilities: Sendable {
-        public var readTextFile: Bool
-        public var writeTextFile: Bool
-        public var terminal: Bool
-
-        public init(
-            readTextFile: Bool = false,
-            writeTextFile: Bool = false,
-            terminal: Bool = false
-        ) {
-            self.readTextFile = readTextFile
-            self.writeTextFile = writeTextFile
-            self.terminal = terminal
-        }
-    }
-
     let channel: ClientChannel
     private let lock = NSLock()
     private var capabilities = Capabilities()
@@ -68,7 +51,7 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         return tools
     }
 
-    public func execute(name: String, argsJSON: String, cwd: String, sessionId: String) async -> String {
+    public func execute(name: String, argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
         let capabilities = currentCapabilities
         guard !sessionId.isEmpty else {
             return "Error: No active ACP session"

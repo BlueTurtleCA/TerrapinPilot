@@ -18,7 +18,7 @@ public struct Agent: Sendable {
     private let toolRegistry: ToolRegistry
     private let sessionStore: SessionStore
     private let contextWindow: Int
-    private let systemPromptTemplate: String
+    private let systemPromptTemplates: [ClientKind: String]
     private let logger: Loggable
     private let slotCount: Int
 
@@ -27,7 +27,7 @@ public struct Agent: Sendable {
         toolRegistry: ToolRegistry,
         sessionStore: SessionStore,
         contextWindow: Int,
-        systemPromptTemplate: String,
+        systemPromptTemplates: [ClientKind: String],
         logger: Loggable,
         slotCount: Int = 1
     ) {
@@ -35,7 +35,7 @@ public struct Agent: Sendable {
         self.toolRegistry = toolRegistry
         self.sessionStore = sessionStore
         self.contextWindow = contextWindow
-        self.systemPromptTemplate = systemPromptTemplate
+        self.systemPromptTemplates = systemPromptTemplates
         self.logger = logger
         self.slotCount = slotCount
     }
@@ -45,13 +45,15 @@ public struct Agent: Sendable {
         prompt: String,
         sessionId: String,
         cwd: String,
+        client: ClientKind,
         tools: [ToolDefinition],
         onChunk: @escaping @Sendable (String) -> Void,
-        onThought: @escaping @Sendable (String) -> Void
+        onThought: @escaping @Sendable (String) -> Void,
+        onSendJSON: @escaping @Sendable ([String: Any]) -> Void
     ) async {
         var history = await sessionStore.getHistory(
             for: sessionId,
-            defaultSystemPrompt: buildSystemPrompt(cwd: cwd)
+            defaultSystemPrompt: buildSystemPrompt(cwd: cwd, client: client)
         )
         history.append(ChatMessage(role: "user", content: prompt))
 
@@ -67,6 +69,9 @@ public struct Agent: Sendable {
         var currentTurn = 0
 
         while currentTurn < maxTurns {
+            // Stop promptly if the client sent session/cancel.
+            if Task.isCancelled { break }
+
             currentTurn += 1
 
             // Compact history if approaching context window limit
@@ -85,6 +90,9 @@ public struct Agent: Sendable {
                         onThought(text)
                     }
                 )
+            } catch is CancellationError {
+                // session/cancel arrived mid-stream; stop quietly.
+                break
             } catch LLMError.httpStatus(let code, let body) {
                 logger.debug("AI Server \(code) Error Response: \(body)")
                 onChunk("⚠️ Error connecting to local AI server.")
@@ -111,18 +119,49 @@ public struct Agent: Sendable {
                         toolCalls: response.toolCalls
                     )
                 )
+                
+                onSendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "plan",
+                            "entries": [
+                                [
+                                    "content": "Enable artifacts",
+                                    "status": "in_progress"
+                                ]
+                            ]
+                        ]
+                    ]
+                ])
 
                 // Execute tools and append results back to chat history
                 for call in response.toolCalls {
-                    onChunk(
-                        "\n\n🛠️ *Executing Tool:* `\(call.function.name)`...\n\n"
-                    )
+                    // Honor session/cancel between tool calls so the rest of
+                    // the batch is skipped. A placeholder result keeps the
+                    // history valid (every tool_call needs a tool message).
+                    if Task.isCancelled {
+                        history.append(
+                            ChatMessage(
+                                role: "tool",
+                                content: "Cancelled by user before this tool ran.",
+                                toolCallId: call.id,
+                                name: call.function.name
+                            )
+                        )
+                        continue
+                    }
 
                     let result = await toolRegistry.execute(
                         name: call.function.name,
                         argsJSON: call.function.arguments,
-                        cwd: cwd
+                        cwd: cwd,
+                        sessionId: sessionId,
+                        sendJSON: onSendJSON
                     )
+                    
                     history.append(
                         ChatMessage(
                             role: "tool",
@@ -132,6 +171,23 @@ public struct Agent: Sendable {
                         )
                     )
                 }
+                
+                onSendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "plan",
+                            "entries": [
+                                [
+                                    "content": "Enable artifacts",
+                                    "status": "completed"
+                                ]
+                            ]
+                        ]
+                    ]
+                ])
 
                 // Loop back to send tool results to the AI server
                 continue
@@ -157,7 +213,7 @@ public struct Agent: Sendable {
 
     // MARK: - Prompt Building
 
-    private func buildSystemPrompt(cwd: String) -> String {
+    private func buildSystemPrompt(cwd: String, client: ClientKind) -> String {
         var customInstructionsBlock = ""
 
         if let agentInstructions = loadWorkspaceInstructions(from: cwd) {
@@ -168,7 +224,12 @@ public struct Agent: Sendable {
                 """
         }
 
-        return systemPromptTemplate
+        let template =
+            systemPromptTemplates[client]
+            ?? systemPromptTemplates[.generic(name: "unknown")]
+            ?? ""
+
+        return template
             .replacingOccurrences(of: "{{CWD}}", with: cwd)
             .replacingOccurrences(of: "{{CUSTOM_INSTRUCTIONS}}", with: customInstructionsBlock)
     }
