@@ -18,7 +18,7 @@ public struct WebTools: ToolProvider {
         ToolDefinition(
             function: FunctionDefinition(
                 name: "web_fetch",
-                description: "Fetches and converts the text content of any HTTP/HTTPS URL into readable plain text.",
+                description: "Fetches and converts the text content of any HTTP/HTTPS URL into readable plain text. Content larger than ~30KB is saved to .terrapin/web/ in the workspace and a preview is returned; use grep_file or read_file on the saved path to inspect the full content.",
                 parameters: [
                     "type": AnySendable("object"),
                     "properties": AnySendable([
@@ -62,6 +62,8 @@ public struct WebTools: ToolProvider {
         let callId = UUID().uuidString
         
         let info = args["url"] != nil ? args["url"] as! String : args["query"] as! String
+        let title = name == "web_search" ? "Searching for '\(info)'" : "Fetching \(info)"
+        let kind = name == "web_search" ? "search" : "fetch"
         
         sendJSON([
             "jsonrpc": "2.0",
@@ -72,14 +74,16 @@ public struct WebTools: ToolProvider {
                     "sessionUpdate": "tool_call",
                     "toolCallId": callId,
                     "name": name,
-                    "title": "Fetching \(info)",
-                    "kind": "fetch",
-                    "status": "in_progress"
+                    "title": title,
+                    "kind": kind,
+                    "status": "in_progress",
+                    // Xcode renders rawInput to show what the tool is working on.
+                    "rawInput": args
                 ]
             ]
         ])
         
-        let response = await Self.execute(name: name, argsJSON: argsJSON)
+        let response = await Self.execute(name: name, argsJSON: argsJSON, cwd: cwd)
         
         sendJSON([
             "jsonrpc": "2.0",
@@ -89,7 +93,17 @@ public struct WebTools: ToolProvider {
                 "update": [
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": callId,
-                    "status": "completed"
+                    "status": response.starts(with: "Error") ? "failed" : "completed",
+                    // Spec shape: each ToolCallContent wraps a ContentBlock.
+                    "content": [
+                        [
+                            "type": "content",
+                            "content": [
+                                "type": "text",
+                                "text": response
+                            ]
+                        ]
+                    ]
                 ]
             ]
         ])
@@ -99,7 +113,12 @@ public struct WebTools: ToolProvider {
 
     // MARK: - Execution Dispatcher
 
-    public static func execute(name: String, argsJSON: String) async -> String {
+    /// Maximum characters returned inline. Larger fetches are saved to the
+    /// workspace so the model can grep/read them instead of flooding context.
+    private static let inlineLimit = 30_000
+    private static let previewLimit = 2_000
+
+    public static func execute(name: String, argsJSON: String, cwd: String) async -> String {
         guard let data = argsJSON.data(using: .utf8),
               let args = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             return "Error: Invalid JSON parameters supplied to \(name)"
@@ -108,7 +127,7 @@ public struct WebTools: ToolProvider {
         switch name {
         case "web_fetch":
             guard let urlString = args["url"] as? String else { return "Error: Missing 'url' parameter" }
-            return await fetchURL(urlString)
+            return await fetchURL(urlString, cwd: cwd)
             
         case "web_search":
             guard let query = args["query"] as? String else { return "Error: Missing 'query' parameter" }
@@ -121,8 +140,11 @@ public struct WebTools: ToolProvider {
     
     // MARK: - Core Web Implementations
     
-    /// Fetches HTML from a web page and strips tags/scripts into plain text
-    private static func fetchURL(_ urlString: String) async -> String {
+    /// Fetches HTML from a web page and strips tags/scripts into plain text.
+    /// Content larger than `inlineLimit` is saved under `.terrapin/web/` in
+    /// the workspace and a pointer + preview is returned instead, so the
+    /// model can grep_file/read_file the full content on demand.
+    private static func fetchURL(_ urlString: String, cwd: String) async -> String {
         guard let url = URL(string: urlString) else {
             return "Error: Invalid URL string '\(urlString)'"
         }
@@ -141,10 +163,66 @@ public struct WebTools: ToolProvider {
                 return "Error: Failed to decode web page data."
             }
             
-            return cleanHTML(htmlString)
+            let text = cleanHTML(htmlString)
+            
+            guard text.count > inlineLimit, !cwd.isEmpty else { return text }
+            
+            guard let savedPath = saveToWorkspace(text: text, urlString: urlString, cwd: cwd) else {
+                return "Warning: could not save large content to workspace; showing first \(inlineLimit) of \(text.count) characters.\n\n"
+                    + String(text.prefix(inlineLimit))
+            }
+            
+            let preview = String(text.prefix(previewLimit))
+            return """
+            Content too large for inline display (\(text.count) characters).
+            Full content saved to: \(savedPath)
+            Use grep_file or read_file on that path to inspect the full content, and delete_file it when done.
+
+            Preview (first \(previewLimit) characters):
+            \(preview)
+            """
         } catch {
             return "Error fetching URL: \(error.localizedDescription)"
         }
+    }
+    
+    /// Writes `text` to `.terrapin/web/` in the workspace using a
+    /// deterministic name derived from the URL, so re-fetching the same URL
+    /// overwrites the same file. Returns the workspace-relative path.
+    private static func saveToWorkspace(text: String, urlString: String, cwd: String) -> String? {
+        let directory = (cwd as NSString).appendingPathComponent(".terrapin/web")
+        do {
+            try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+        } catch { return nil }
+        
+        let url = URL(string: urlString)
+        var base = url?.host ?? "web"
+        if let path = url?.path, !path.isEmpty, path != "/" { base += path }
+        base = base.replacingOccurrences(of: "[^A-Za-z0-9]", with: "-", options: .regularExpression)
+        base = String(base.prefix(60))
+        
+        // FNV-1a hash of the URL so distinct URLs never collide.
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in urlString.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x100000001b3
+        }
+        
+        let ext = url?.pathExtension ?? ""
+        let fileName = "\(base)-\(String(hash, radix: 16)).\(ext.isEmpty ? "txt" : ext)"
+        let filePath = (directory as NSString).appendingPathComponent(fileName)
+        
+        do {
+            try text.write(toFile: filePath, atomically: true, encoding: .utf8)
+        } catch { return nil }
+        
+        // Workspace-relative path so the model can pass it straight to
+        // grep_file/read_file.
+        var relative = filePath
+        if relative.hasPrefix(cwd) {
+            relative = String(relative.dropFirst(cwd.count))
+        }
+        return relative.hasPrefix("/") ? String(relative.dropFirst()) : relative
     }
     
     /// Executes web search using Tavily API (or falls back to DuckDuckGo HTML)
@@ -223,6 +301,6 @@ public struct WebTools: ToolProvider {
         let lines = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        return lines.joined(separator: "\n").prefix(4000).description
+        return lines.joined(separator: "\n")
     }
 }

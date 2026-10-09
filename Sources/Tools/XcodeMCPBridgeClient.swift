@@ -20,9 +20,16 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private var activeWorkspaceIdentifier: String?
     private var tools: [ToolDefinition] = []
     private var openedWorkspacePath: String?
+    private var started = false
+    
+    /// True once `start()` has spawned the mcpbridge process.
+    public var isStarted: Bool { started }
 
     public func definitions() async -> [ToolDefinition] { tools }
 
+    // File tools (XcodeMV, XcodeRM, XcodeLS) are intentionally not exposed:
+    // the wrapper tools (move_file, delete_file, list_directory) prefer the
+    // bridge internally and fall back to local operations when it fails.
     private let allowedMCPBridgeTools: Set<String> = [
         "BuildProject",
         "GetBuildLog",
@@ -30,7 +37,8 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         "RunSomeTests",
         "RunAllTests",
         "RenderPreview",
-        "DocumentationSearch"
+        "DocumentationSearch",
+        "XcodeOpenWorkspace"
     ]
     
     public func execute(name: String, argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void)
@@ -91,15 +99,18 @@ public actor XcodeMCPBridgeClient: ToolProvider {
             cwd: cwd
         )
         logger.debug("XcodeOpenWorkspace(\(cwd)): \(result)")
-        openedWorkspacePath = cwd
 
         // The bridge identifies workspaces by an opaque identifier (e.g.
         // "workspace-LR49lofe9w"), not by path, so capture it from the open
         // response and fall back to listing workspaces if it is missing.
+        // Only mark the workspace as opened once an identifier is resolved;
+        // otherwise the next turn retries the open.
         if let identifier = parseWorkspaceIdentifier(from: result) {
             activeWorkspaceIdentifier = identifier
-        } else {
-            activeWorkspaceIdentifier = await resolveWorkspaceIdentifier(matchingCWD: cwd)
+            openedWorkspacePath = cwd
+        } else if let resolved = await resolveWorkspaceIdentifier(matchingCWD: cwd) {
+            activeWorkspaceIdentifier = resolved
+            openedWorkspacePath = cwd
         }
     }
 
@@ -131,6 +142,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         self.process = process
 
         try process.run()
+        started = true
 
         // 2. Step 1 of MCP Handshake: Send initialize request
         let initRequest: [String: Any] = [
@@ -217,19 +229,28 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         }
 
         // 2. Auto-inject the cached workspace identifier if missing, since Xcode
-        //    workspace tools require it to resolve the target project. Fall back
-        //    to the project directory for bridges that accept paths.
-        if argsDict["workspaceIdentifier"] == nil {
-            if let cachedWorkspace = activeWorkspaceIdentifier {
-                argsDict["workspaceIdentifier"] = cachedWorkspace
-            } else if !cwd.isEmpty {
-                argsDict["workspaceIdentifier"] = cwd
-            }
+        //    workspace tools require it to resolve the target project. When no
+        //    identifier is cached, omit the field: the bridge's error then drives
+        //    the resolve-and-retry below instead of injecting a raw path the
+        //    bridge would reject as unknown.
+        if argsDict["workspaceIdentifier"] == nil,
+            let cachedWorkspace = activeWorkspaceIdentifier
+        {
+            argsDict["workspaceIdentifier"] = cachedWorkspace
         }
                 
         // Send initial RPC tool call request
         let response = sendToolRPC(name: name, argsDict: argsDict)
         let outputText = parseToolOutput(response: response, name: name)
+
+        // Cache the identifier returned by an explicit open (whether triggered
+        // by prepare or by the model calling XcodeOpenWorkspace) so subsequent
+        // calls inject it without re-resolving.
+        if name == "XcodeOpenWorkspace",
+            let identifier = parseWorkspaceIdentifier(from: outputText)
+        {
+            activeWorkspaceIdentifier = identifier
+        }
 
         // 3. Check if mcpbridge threw a tabIdentifier required error
         if outputText.contains("tabIdentifier is required for this action") {
@@ -247,10 +268,12 @@ public actor XcodeMCPBridgeClient: ToolProvider {
             }
         }
 
-        // 4. If the bridge rejects the injected workspace identifier, resolve
-        //    the correct one from XcodeListWorkspaces and retry once.
+        // 4. If the bridge rejects the injected workspace identifier (or none
+        //    was available), resolve the correct one from XcodeListWorkspaces
+        //    and retry once.
         if name != "XcodeListWorkspaces",
             outputText.contains("Unknown workspace identifier")
+                || outputText.contains("workspaceIdentifier is required")
         {
             if let resolved = await resolveWorkspaceIdentifier(matchingCWD: cwd) {
                 activeWorkspaceIdentifier = resolved
@@ -350,13 +373,22 @@ public actor XcodeMCPBridgeClient: ToolProvider {
 
     /// Extracts the `workspaceIdentifier` field from an XcodeOpenWorkspace
     /// response, e.g. `{"workspaceIdentifier":"workspace-LR49lofe9w", ...}`.
+    /// Tries a strict whole-text JSON parse first, then falls back to scanning
+    /// for the field so responses with surrounding prose still resolve.
     private func parseWorkspaceIdentifier(from text: String) -> String? {
-        guard let data = text.data(using: .utf8),
+        if let data = text.data(using: .utf8),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let identifier = json["workspaceIdentifier"] as? String,
             !identifier.isEmpty
-        else { return nil }
-        return identifier
+        {
+            return identifier
+        }
+
+        guard let match = text.firstMatch(
+            of: /"workspaceIdentifier"\s*:\s*"([^"]+)"/
+        ) else { return nil }
+        let identifier = String(match.1)
+        return identifier.isEmpty ? nil : identifier
     }
 
     /// Lists open workspaces and returns the identifier whose `workspacePath`
@@ -452,7 +484,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         case "GetBuildLog", "XcodeListNavigatorIssues":
             return ("search", "Fetching Xcode Diagnostics")
         case "RenderPreview":
-            return ("fetch", "Rendering SwiftUI Preview")
+            return ("execute", "Rendering SwiftUI Preview")
         default:
             return ("execute", "Running \(name)")
         }

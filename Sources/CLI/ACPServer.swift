@@ -16,7 +16,6 @@ import Tools
 final class ACPServer: Sendable {
     private let agent: Agent
     private let sessionStore: SessionStore
-    private let tools: [ToolDefinition]
     private let toolRegistry: ToolRegistry
     private let xcodeBridge: XcodeMCPBridgeClient
     private let defaultClient: ClientKind
@@ -38,7 +37,6 @@ final class ACPServer: Sendable {
     init(
         agent: Agent,
         sessionStore: SessionStore,
-        tools: [ToolDefinition],
         toolRegistry: ToolRegistry,
         xcodeBridge: XcodeMCPBridgeClient,
         clientChannel: ClientChannel,
@@ -48,7 +46,6 @@ final class ACPServer: Sendable {
     ) {
         self.agent = agent
         self.sessionStore = sessionStore
-        self.tools = tools
         self.toolRegistry = toolRegistry
         self.xcodeBridge = xcodeBridge
         self.defaultClient = defaultClient
@@ -216,11 +213,8 @@ final class ACPServer: Sendable {
         let cwd =
             await sessionStore.getCWD(for: sessionId)
             ?? Self.extractParam(params, key: "cwd")
-
-        // Merge the negotiated client tools (fs/*, terminal/*) into this
-        // prompt's tool list so the model can call them this turn.
-        var promptTools = self.tools
-        promptTools.append(contentsOf: await self.clientTools.definitions())
+        
+        let tools = await self.toolRegistry.definitions()
 
         let box = PromptTaskBox()
         let task = Task.detached {
@@ -229,7 +223,7 @@ final class ACPServer: Sendable {
                 sessionId: sessionId,
                 cwd: cwd,
                 client: self.clientKind,
-                tools: promptTools,
+                tools: tools,
                 onChunk: { text in
                     self.sendChunk(sessionId: sessionId, text: text)
                 },

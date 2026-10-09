@@ -11,14 +11,16 @@ import Stores
 public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
     let acpClientTools: ACPClientTools
     let clientChannel: ClientChannel
+    let xcodeBridge: XcodeMCPBridgeClient?
     
     enum ACPError: Error {
         case message(String)
     }
     
-    public init(clientChannel: ClientChannel) {
+    public init(clientChannel: ClientChannel, xcodeBridge: XcodeMCPBridgeClient? = nil) {
         self.acpClientTools = ACPClientTools(channel: clientChannel)
         self.clientChannel = clientChannel
+        self.xcodeBridge = xcodeBridge
     }
     
     public func definitions() async -> [ToolDefinition] {
@@ -27,6 +29,9 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         tools.append(Self.writeTextFileDefinition)
         tools.append(Self.editTextFileDefinition)
         tools.append(Self.grepTextFileDefinition)
+        tools.append(Self.moveFileDefinition)
+        tools.append(Self.deleteFileDefinition)
+        tools.append(Self.listDirectoryDefinition)
         return tools
     }
     
@@ -44,6 +49,12 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             return await editTextFile(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
         case "grep_file":
             return await grepTextFile(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "move_file":
+            return await moveFile(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "delete_file":
+            return await deleteFile(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "list_directory":
+            return await listDirectory(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
         default:
             return "Error: Unknown tool '\(name)'"
         }
@@ -81,13 +92,13 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
     private static let writeTextFileDefinition = ToolDefinition(
         function: FunctionDefinition(
             name: "write_file",
-            description: "Writes a complete file to the client's file system. For creating or overwriting any project files, you MUST use this call.",
+            description: "Writes a complete file to the client's file system, creating any missing parent directories. For creating or overwriting any project files, you MUST use this call.",
             parameters: [
                 "type": AnySendable("object"),
                 "properties": AnySendable([
                     "path": AnySendable([
                         "type": AnySendable("string"),
-                        "description": AnySendable("Path of the file to read. Relative paths are resolved against the working directory.")
+                        "description": AnySendable("Path of the file to write. Relative paths are resolved against the working directory.")
                     ]),
                     "content": AnySendable([
                         "type": AnySendable("string"),
@@ -127,13 +138,13 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
     private static let grepTextFileDefinition = ToolDefinition(
         function: FunctionDefinition(
             name: "grep_file",
-            description: "Searches workspace files for a text string or regex pattern.",
+            description: "Searches workspace files for an extended regex pattern (e.g. 'foo|bar', 'func\\s+\\w+').",
             parameters: [
                 "type": AnySendable("object"),
                 "properties": AnySendable([
                     "query": AnySendable([
                         "type": AnySendable("string"),
-                        "description": AnySendable("The exact text or regex pattern to search for.")
+                        "description": AnySendable("The extended regex pattern to search for. Set isRegex to false to search for a literal string instead.")
                     ]),
                     "pathPattern": AnySendable([
                         "type": AnySendable("string"),
@@ -142,9 +153,68 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                     "caseSensitive": AnySendable([
                         "type": AnySendable("boolean"),
                         "description": AnySendable("Whether the search should be case sensitive. Defaults to false.")
+                    ]),
+                    "isRegex": AnySendable([
+                        "type": AnySendable("boolean"),
+                        "description": AnySendable("Whether to treat query as an extended regex pattern. Defaults to true. Set to false to search for a literal string.")
                     ])
                 ]),
                 "required": AnySendable([AnySendable("query")])
+            ]
+        )
+    )
+    
+    private static let moveFileDefinition = ToolDefinition(
+        function: FunctionDefinition(
+            name: "move_file",
+            description: "Moves or renames a file to a new path within the workspace, creating any missing parent directories at the destination. The destination must not already exist.",
+            parameters: [
+                "type": AnySendable("object"),
+                "properties": AnySendable([
+                    "path": AnySendable([
+                        "type": AnySendable("string"),
+                        "description": AnySendable("Path of the file to move. Relative paths are resolved against the working directory.")
+                    ]),
+                    "newPath": AnySendable([
+                        "type": AnySendable("string"),
+                        "description": AnySendable("The new path for the file. Relative paths are resolved against the working directory.")
+                    ])
+                ]),
+                "required": AnySendable([AnySendable("path"), AnySendable("newPath")])
+            ]
+        )
+    )
+    
+    private static let deleteFileDefinition = ToolDefinition(
+        function: FunctionDefinition(
+            name: "delete_file",
+            description: "Deletes a file from the client's file system. Destructive and irreversible: only use when the user explicitly asked to delete the file.",
+            parameters: [
+                "type": AnySendable("object"),
+                "properties": AnySendable([
+                    "path": AnySendable([
+                        "type": AnySendable("string"),
+                        "description": AnySendable("Path of the file to delete. Relative paths are resolved against the working directory.")
+                    ])
+                ]),
+                "required": AnySendable([AnySendable("path")])
+            ]
+        )
+    )
+    
+    private static let listDirectoryDefinition = ToolDefinition(
+        function: FunctionDefinition(
+            name: "list_directory",
+            description: "Lists the contents of a directory in the workspace, including file names and sizes.",
+            parameters: [
+                "type": AnySendable("object"),
+                "properties": AnySendable([
+                    "path": AnySendable([
+                        "type": AnySendable("string"),
+                        "description": AnySendable("Directory to list. Relative paths are resolved against the working directory. Defaults to the workspace root.")
+                    ])
+                ]),
+                "required": AnySendable([AnySendable]())
             ]
         )
     )
@@ -270,6 +340,34 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                 "update": update
             ]
         ])
+        
+        // The ACP client creates the file itself but not its parent
+        // directories (the spec only requires the file), and ACP has no
+        // mkdir method. The agent runs on the same machine as the workspace,
+        // so create any missing intermediate directories locally first.
+        let parentDirectory = (path as NSString).deletingLastPathComponent
+        if !parentDirectory.isEmpty, !FileManager.default.fileExists(atPath: parentDirectory) {
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: parentDirectory,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                sendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": callId,
+                            "status": "failed"
+                        ]
+                    ]
+                ])
+                return "Error creating parent directory for '\(path)': \(error.localizedDescription)"
+            }
+        }
         
         switch await clientChannel.request(
             method: "fs/write_text_file",
@@ -439,15 +537,17 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             return "Error: Missing or empty 'query' parameter"
         }
         
-        let pathPattern = args["path_pattern"] as? String
-        let caseSensitive = args["case_sensitive"] as? Bool ?? false
+        let pathPattern = args["pathPattern"] as? String
+        let caseSensitive = args["caseSensitive"] as? Bool ?? false
+        let isRegex = args["isRegex"] as? Bool ?? true
         
             
         let (matches, _) = await runStandardGrep(
             query: query,
             cwd: cwd,
             pathPattern: pathPattern,
-            caseSensitive: caseSensitive
+            caseSensitive: caseSensitive,
+            isRegex: isRegex
         )
         
         let resultText = matches.isEmpty ? "No matches found for '\(query)'." : matches.joined(separator: "\n")
@@ -485,6 +585,324 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         return resultText
     }
     
+    private func moveFile(argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        let callId = "call_" + UUID().uuidString
+        
+        guard let args = Self.parseArgs(argsJSON) else {
+            return "Error: Invalid JSON parameters supplied to move_file"
+        }
+        guard let rawPath = args["path"] as? String, !rawPath.isEmpty,
+              let rawNewPath = args["newPath"] as? String, !rawNewPath.isEmpty
+                else {
+            return "Error: Missing 'path' or 'newPath' parameter"
+        }
+        let path = Self.resolveWorkspacePath(relativePath: rawPath, workspaceRoot: cwd)
+        let newPath = Self.resolveWorkspacePath(relativePath: rawNewPath, workspaceRoot: cwd)
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+        let newFileName = URL(fileURLWithPath: newPath).lastPathComponent
+        
+        guard Self.isWithinWorkspace(path, workspaceRoot: cwd) else {
+            return "Error: Refusing to move '\(path)': path is outside the workspace"
+        }
+        guard Self.isWithinWorkspace(newPath, workspaceRoot: cwd) else {
+            return "Error: Refusing to move to '\(newPath)': path is outside the workspace"
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "Error: Source file does not exist: \(path)"
+        }
+        guard !FileManager.default.fileExists(atPath: newPath) else {
+            return "Error: Destination already exists: \(newPath)"
+        }
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": callId,
+                    "name": "move_file",
+                    "title": "Moving \(fileName) to \(newFileName)",
+                    "kind": "edit",
+                    "status": "in_progress",
+                    "locations": [
+                        ["path": path],
+                        ["path": newPath]
+                    ]
+                ]
+            ]
+        ])
+        
+        // The destination's parent directory may not exist yet (a move into
+        // a new subdirectory). Neither the Xcode bridge nor the ACP write
+        // creates it, so create any missing intermediate directories locally.
+        let destinationDirectory = (newPath as NSString).deletingLastPathComponent
+        if !destinationDirectory.isEmpty, !FileManager.default.fileExists(atPath: destinationDirectory) {
+            do {
+                try FileManager.default.createDirectory(
+                    atPath: destinationDirectory,
+                    withIntermediateDirectories: true
+                )
+            } catch {
+                sendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": callId,
+                            "status": "failed"
+                        ]
+                    ]
+                ])
+                return "Error creating parent directory for '\(newPath)': \(error.localizedDescription)"
+            }
+        }
+        
+        // Prefer the Xcode bridge so the IDE stays in sync (navigator, open
+        // editors, project references); fall back to local operations.
+        if let bridge = xcodeBridge, await bridge.isStarted {
+            let from = Self.workspaceRelativePath(path, workspaceRoot: cwd)
+            let to = Self.workspaceRelativePath(newPath, workspaceRoot: cwd)
+            let bridgeResult = await bridge.callTool(
+                name: "XcodeMV",
+                argsJSON: Self.makeArgsJSON(["from": from, "to": to]),
+                cwd: cwd
+            )
+            if !bridgeResult.starts(with: "Error") {
+                sendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": callId,
+                            "status": "completed"
+                        ]
+                    ]
+                ])
+                return "File moved successfully: \(path) -> \(newPath)"
+            }
+        }
+        
+        // Compose the move from ACP primitives so the client tracks the new
+        // file being written: read via the client, write via the client, then
+        // remove the original locally (ACP has no delete method).
+        do {
+            let content = try await internalReadTextFile(clientChannel: self.clientChannel, sessionId: sessionId, path: path)
+            try await internalWriteTextFile(clientChannel: self.clientChannel, sessionId: sessionId, path: newPath, content: content)
+        } catch {
+            // The file cannot round-trip as text (e.g. binary): move it directly.
+            do {
+                try FileManager.default.moveItem(atPath: path, toPath: newPath)
+            } catch {
+                sendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": callId,
+                            "status": "failed"
+                        ]
+                    ]
+                ])
+                return "Error renaming '\(path)' to '\(newPath)': \(error.localizedDescription)"
+            }
+        }
+        
+        do {
+            try FileManager.default.removeItem(atPath: path)
+        } catch {
+            sendJSON([
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": [
+                    "sessionId": sessionId,
+                    "update": [
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": callId,
+                        "status": "failed"
+                    ]
+                ]
+            ])
+            return "Error: Created '\(newPath)' but failed to delete the original '\(path)': \(error.localizedDescription)"
+        }
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": "completed"
+                ]
+            ]
+        ])
+        
+        return "File moved successfully: \(path) -> \(newPath)"
+    }
+    
+    private func deleteFile(argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        let callId = "call_" + UUID().uuidString
+        
+        guard let args = Self.parseArgs(argsJSON) else {
+            return "Error: Invalid JSON parameters supplied to delete_file"
+        }
+        guard let rawPath = args["path"] as? String, !rawPath.isEmpty else {
+            return "Error: Missing 'path' parameter"
+        }
+        let path = Self.resolveWorkspacePath(relativePath: rawPath, workspaceRoot: cwd)
+        let fileName = URL(fileURLWithPath: path).lastPathComponent
+        
+        guard Self.isWithinWorkspace(path, workspaceRoot: cwd) else {
+            return "Error: Refusing to delete '\(path)': path is outside the workspace"
+        }
+        guard FileManager.default.fileExists(atPath: path) else {
+            return "Error: File does not exist: \(path)"
+        }
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": callId,
+                    "name": "delete_file",
+                    "title": "Deleting \(fileName)",
+                    "kind": "edit",
+                    "status": "in_progress",
+                    "locations": [
+                        ["path": path]
+                    ]
+                ]
+            ]
+        ])
+        
+        // Prefer the Xcode bridge so the IDE stays in sync (navigator, open
+        // editors, project references); fall back to local operations.
+        if let bridge = xcodeBridge, await bridge.isStarted {
+            let relPath = Self.workspaceRelativePath(path, workspaceRoot: cwd)
+            let bridgeResult = await bridge.callTool(
+                name: "XcodeRM",
+                argsJSON: Self.makeArgsJSON(["path": relPath]),
+                cwd: cwd
+            )
+            if !bridgeResult.starts(with: "Error") {
+                sendJSON([
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": [
+                        "sessionId": sessionId,
+                        "update": [
+                            "sessionUpdate": "tool_call_update",
+                            "toolCallId": callId,
+                            "status": "completed"
+                        ]
+                    ]
+                ])
+                return "File deleted successfully: \(path)"
+            }
+        }
+        
+        do {
+            try FileManager.default.removeItem(atPath: path)
+        } catch {
+            sendJSON([
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": [
+                    "sessionId": sessionId,
+                    "update": [
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": callId,
+                        "status": "failed"
+                    ]
+                ]
+            ])
+            return "Error deleting '\(path)': \(error.localizedDescription)"
+        }
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": "completed"
+                ]
+            ]
+        ])
+        
+        return "File deleted successfully: \(path)"
+    }
+    
+    private func listDirectory(argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        let callId = "call_" + UUID().uuidString
+        
+        let args = Self.parseArgs(argsJSON) ?? [:]
+        let rawPath = (args["path"] as? String) ?? ""
+        let path = rawPath.isEmpty ? cwd : Self.resolveWorkspacePath(relativePath: rawPath, workspaceRoot: cwd)
+        let dirName = URL(fileURLWithPath: path).lastPathComponent
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": callId,
+                    "name": "list_directory",
+                    "title": "Listing \(dirName)",
+                    "kind": "read",
+                    "status": "in_progress",
+                    "locations": [
+                        ["path": path]
+                    ]
+                ]
+            ]
+        ])
+        
+        var result: String
+        if let bridge = xcodeBridge, await bridge.isStarted {
+            let relPath = Self.workspaceRelativePath(path, workspaceRoot: cwd)
+            let bridgeResult = await bridge.callTool(
+                name: "XcodeLS",
+                argsJSON: Self.makeArgsJSON(["path": relPath]),
+                cwd: cwd
+            )
+            result = bridgeResult.starts(with: "Error") ? runListDirectory(path) : bridgeResult
+        } else {
+            result = runListDirectory(path)
+        }
+        
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": result.starts(with: "Error") ? "failed" : "completed"
+                ]
+            ]
+        ])
+        
+        return result
+    }
+    
     private func internalReadTextFile(clientChannel: ClientChannel, sessionId: String, path: String) async throws -> String {
         do {            
             do {
@@ -509,6 +927,22 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                 return try String(contentsOfFile: path, encoding: .utf8)
             }
             throw error
+        }
+    }
+    
+    private func internalWriteTextFile(clientChannel: ClientChannel, sessionId: String, path: String, content: String) async throws {
+        do {
+            switch await clientChannel.request(
+                method: "fs/write_text_file",
+                params: ["sessionId": sessionId, "path": path, "content": content]
+            ) {
+            case .result:
+                return
+            case .error(let message):
+                throw ACPError.message("Error writing text file \(path): message \(message)")
+            }
+        } catch {
+            try content.write(toFile: path, atomically: true, encoding: .utf8)
         }
     }
     
@@ -540,11 +974,35 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         return resolvedURL.path
     }
     
+    private static func isWithinWorkspace(_ path: String, workspaceRoot: String) -> Bool {
+        let root = URL(fileURLWithPath: (workspaceRoot as NSString).expandingTildeInPath).standardizedFileURL.path
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        return standardized == root || standardized.hasPrefix(root + "/")
+    }
+    
+    /// The inverse of resolveWorkspacePath: a workspace-relative path in the
+    /// form the Xcode MCP bridge expects (e.g. "TerrapinPilot/Sources/Foo.swift").
+    private static func workspaceRelativePath(_ absolutePath: String, workspaceRoot: String) -> String {
+        let root = URL(fileURLWithPath: (workspaceRoot as NSString).expandingTildeInPath).standardizedFileURL
+        let abs = URL(fileURLWithPath: absolutePath).standardizedFileURL
+        guard abs.path.hasPrefix(root.path + "/") else {
+            return absolutePath
+        }
+        let relative = String(abs.path.dropFirst(root.path.count + 1))
+        return root.lastPathComponent + "/" + relative
+    }
+    
+    private static func makeArgsJSON(_ args: [String: String]) -> String {
+        (try? JSONSerialization.data(withJSONObject: args))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+    
     private func runStandardGrep(
         query: String,
         cwd: String,
         pathPattern: String?,
-        caseSensitive: Bool
+        caseSensitive: Bool,
+        isRegex: Bool
     ) async -> (matches: [String], locations: [[String: Any]]) {
         let process = Process()
         let pipe = Pipe()
@@ -560,6 +1018,14 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             "--exclude-dir=.build",
             "--exclude-dir=DerivedData"
         ]
+        
+        // Extended regex by default so `|`, `+`, `?`, ... behave as most
+        // models expect; -F treats the query as a literal string instead.
+        if isRegex {
+            arguments.append("-E")
+        } else {
+            arguments.append("-F")
+        }
         
         if !caseSensitive { arguments.append("-i") }
         if let pattern = pathPattern, !pattern.isEmpty {
@@ -605,6 +1071,26 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             return (matches, locations)
         } catch {
             return (["Grep execution failed: \(error.localizedDescription)"], [])
+        }
+    }
+    
+    private func runListDirectory(_ path: String) -> String {
+        let process = Process()
+        let pipe = Pipe()
+        
+        process.executableURL = URL(fileURLWithPath: "/bin/ls")
+        process.arguments = ["-l", path]
+        process.standardOutput = pipe
+        
+        do {
+            try process.run()
+            process.waitUntilExit()
+            
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return output.isEmpty ? "(empty directory)" : output
+        } catch {
+            return "Error listing directory '\(path)': \(error.localizedDescription)"
         }
     }
 }

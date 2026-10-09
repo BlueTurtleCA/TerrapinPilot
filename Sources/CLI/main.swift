@@ -26,9 +26,8 @@ let mcpClient = XcodeMCPBridgeClient(logger)
 //    native ACP client tools). The Xcode MCP bridge is added to the registry
 //    by the ACP server after client detection.
 let clientChannel = ClientChannel()
-let clientTools = ACPWrapperTools(clientChannel: clientChannel)
+let clientTools = ACPWrapperTools(clientChannel: clientChannel, xcodeBridge: mcpClient)
 let toolRegistry = ToolRegistry([WebTools(), clientTools])
-let allTools = await toolRegistry.definitions()
 
 let contextWindow: Int
 if let override = config.contextWindowOverride {
@@ -62,7 +61,6 @@ let agent = Agent(
 let server = ACPServer(
     agent: agent,
     sessionStore: sessionStore,
-    tools: allTools,
     toolRegistry: toolRegistry,
     xcodeBridge: mcpClient,
     clientChannel: clientChannel,
