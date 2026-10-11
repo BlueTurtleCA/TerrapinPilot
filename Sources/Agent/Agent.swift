@@ -51,9 +51,26 @@ public struct Agent: Sendable {
         onThought: @escaping @Sendable (String) -> Void,
         onSendJSON: @escaping @Sendable ([String: Any]) -> Void
     ) async {
+        // /debug <file>: replay raw JSON objects from a file straight to the
+        // client via sendJSON, bypassing the LLM entirely.
+        if let debugPath = Self.debugFilePath(in: prompt) {
+            await runDebugReplay(
+                path: debugPath,
+                cwd: cwd,
+                sessionId: sessionId,
+                onChunk: onChunk,
+                onSendJSON: onSendJSON
+            )
+            return
+        }
+
         var history = await sessionStore.getHistory(
             for: sessionId,
-            defaultSystemPrompt: buildSystemPrompt(cwd: cwd, client: client)
+            defaultSystemPrompt: buildSystemPrompt(
+                cwd: cwd,
+                client: client,
+                terminalToolsAvailable: tools.contains { $0.function.name == "run_command" }
+            )
         )
         history.append(ChatMessage(role: "user", content: prompt))
 
@@ -211,9 +228,72 @@ public struct Agent: Sendable {
         await sessionStore.saveHistory(history, for: sessionId)
     }
 
+    // MARK: - Debug Replay
+
+    /// Parses a `/debug <file>` prompt into a file path, or nil when the
+    /// prompt is not a debug command.
+    private static func debugFilePath(in prompt: String) -> String? {
+        let trimmed = prompt.split(whereSeparator: \.isNewline ).last!.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/debug") else { return nil }
+        let path = trimmed
+            .dropFirst("/debug".count)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return path.isEmpty ? nil : path
+    }
+
+    /// Reads `path`, splits its contents on `---` delimiters, and sends each
+    /// JSON object to the client via `onSendJSON`. No LLM call is made and
+    /// the session history is left untouched.
+    private func runDebugReplay(
+        path: String,
+        cwd: String,
+        sessionId: String,
+        onChunk: @escaping @Sendable (String) -> Void,
+        onSendJSON: @escaping @Sendable ([String: Any]) -> Void
+    ) async {
+        let filePath = path.hasPrefix("/") ? path : cwd + "/" + path
+
+        guard let contents = try? String(contentsOfFile: filePath, encoding: .utf8) else {
+            logger.debug("/debug: could not read \(filePath)")
+            onChunk("⚠️ /debug: could not read file: \(filePath)")
+            return
+        }
+
+        let uuid = UUID().uuidString
+        
+        let chunks = contents
+            .components(separatedBy: "---")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "[SessionId]", with: sessionId, options: .caseInsensitive)
+                .replacingOccurrences(of: "[UUID]", with: uuid, options: .caseInsensitive) }
+            .filter { !$0.isEmpty }
+
+        guard !chunks.isEmpty else {
+            onChunk("⚠️ /debug: no JSON objects found in \(filePath)")
+            return
+        }
+
+        var sent = 0
+        for (index, chunk) in chunks.enumerated() {
+            guard
+                let data = chunk.data(using: .utf8),
+                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                logger.debug("/debug: skipping invalid JSON at object #\(index + 1)")
+                onChunk("⚠️ /debug: skipping invalid JSON at object #\(index + 1)")
+                continue
+            }
+            logger.debug("/debug: sending object #\(index + 1) of \(chunks.count)")
+            onSendJSON(object)
+            sent += 1
+        }
+
+        onChunk("✅ /debug: sent \(sent) of \(chunks.count) JSON object(s) from \(filePath)")
+    }
+
     // MARK: - Prompt Building
 
-    private func buildSystemPrompt(cwd: String, client: ClientKind) -> String {
+    private func buildSystemPrompt(cwd: String, client: ClientKind, terminalToolsAvailable: Bool) -> String {
         var customInstructionsBlock = ""
 
         if let agentInstructions = loadWorkspaceInstructions(from: cwd) {
@@ -224,6 +304,15 @@ public struct Agent: Sendable {
                 """
         }
 
+        // Terminal tools are negotiated per client (clientCapabilities.terminal),
+        // so only advertise them when the client actually supports them.
+        let terminalToolsBlock = terminalToolsAvailable ? """
+            ### TERMINAL & SHELL COMMANDS
+            - You have terminal tools: run_command (one-shot: runs a command, waits for it to finish, and returns the exit status and output) plus terminal_create, terminal_output, terminal_wait_for_exit, terminal_kill, and terminal_release for long-running or background commands.
+            - Prefer run_command for one-shot commands (git, swift, xcodebuild, scripts, ...). Use terminal_create with the other terminal tools when a command runs for a long time or you need to observe it while doing other work, and always terminal_release terminals you created when done.
+
+            """ : ""
+
         let template =
             systemPromptTemplates[client]
             ?? systemPromptTemplates[.generic(name: "unknown")]
@@ -231,6 +320,7 @@ public struct Agent: Sendable {
 
         return template
             .replacingOccurrences(of: "{{CWD}}", with: cwd)
+            .replacingOccurrences(of: "{{TERMINAL_TOOLS}}", with: terminalToolsBlock)
             .replacingOccurrences(of: "{{CUSTOM_INSTRUCTIONS}}", with: customInstructionsBlock)
     }
 

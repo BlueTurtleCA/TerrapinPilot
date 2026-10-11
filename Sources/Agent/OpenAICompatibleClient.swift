@@ -37,9 +37,7 @@ public struct OpenAICompatibleClient: LLMClient {
         self.model = model
         self.session = session ?? Self.makeSession()
         self.debugLog = debugLog
-        self.debugLogDirectory = debugLog
-            ? URL(fileURLWithPath: "/tmp/terrapinpilot-llm")
-            : nil
+        self.debugLogDirectory = debugLog ? TerrapinPaths.logsDirectory : nil
     }
 
     public func complete(

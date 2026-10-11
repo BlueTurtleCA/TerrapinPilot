@@ -18,7 +18,7 @@ struct Config: Sendable {
     /// Sessions are pinned to a slot so the KV cache is reused across turns.
     let slots: Int
     /// When true, each request body sent to the AI server is written to
-    /// /tmp/terrapinpilot-llm/NNNN.json for prefix-stability debugging.
+    /// ~/.terrapinpilot/logs/NNNN.json for prefix-stability debugging.
     let debugLog: Bool
     /// Client assumed when the connecting ACP client does not identify
     /// itself via `clientInfo` in the `initialize` request.

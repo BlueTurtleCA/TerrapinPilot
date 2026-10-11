@@ -16,7 +16,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "Logger"),
-        .target(name: "Stores"),
+        .target(
+            name: "Stores",
+            dependencies: ["Logger"]
+        ),
         .target(name: "Enums"),
         .target(
             name: "Helpers",

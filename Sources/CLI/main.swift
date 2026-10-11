@@ -16,7 +16,11 @@ import Tools
 let config = Config.load()
 
 let logger = OSLogger()
-let sessionStore = SessionStore()
+let sessionStore = SessionStore(logger: logger)
+
+// Remove session files that haven't been updated within the retention
+// period (the same startup sweep Claude Code performs).
+await sessionStore.cleanupStaleSessions()
 
 // 2. Create the native Xcode MCP bridge client. It is started lazily by the
 //    ACP server once the connecting client identifies itself as Xcode.
@@ -26,7 +30,7 @@ let mcpClient = XcodeMCPBridgeClient(logger)
 //    native ACP client tools). The Xcode MCP bridge is added to the registry
 //    by the ACP server after client detection.
 let clientChannel = ClientChannel()
-let clientTools = ACPWrapperTools(clientChannel: clientChannel, xcodeBridge: mcpClient)
+let clientTools = ACPClientTools(clientChannel: clientChannel, xcodeBridge: mcpClient)
 let toolRegistry = ToolRegistry([WebTools(), clientTools])
 
 let contextWindow: Int
@@ -39,7 +43,7 @@ if let override = config.contextWindowOverride {
 }
 logger.debug("Using context window of: \(contextWindow)")
 if config.debugLog {
-    logger.debug("Debug logging enabled: request bodies -> /tmp/terrapinpilot-llm/")
+    logger.debug("Debug logging enabled: request bodies -> ~/.terrapinpilot/logs/")
 }
 
 // 4. Wire up the agent

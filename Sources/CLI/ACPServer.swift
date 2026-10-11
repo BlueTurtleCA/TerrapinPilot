@@ -21,7 +21,7 @@ final class ACPServer: Sendable {
     private let defaultClient: ClientKind
     private let logger: Loggable
     private let clientChannel: ClientChannel
-    private let clientTools: ACPWrapperTools
+    private let clientTools: ACPClientTools
     private let stdoutLock = NSLock()
     // In-flight session/prompt tasks, keyed by session id. Guarded by
     // taskLock so session/cancel can find and stop the running turn.
@@ -40,7 +40,7 @@ final class ACPServer: Sendable {
         toolRegistry: ToolRegistry,
         xcodeBridge: XcodeMCPBridgeClient,
         clientChannel: ClientChannel,
-        clientTools: ACPWrapperTools,
+        clientTools: ACPClientTools,
         defaultClient: ClientKind,
         logger: Loggable
     ) {
@@ -82,9 +82,11 @@ final class ACPServer: Sendable {
 
         let method = json["method"] as? String ?? ""
         let hasId = json.keys.contains("id") && !(json["id"] is NSNull)
-        // Safely parses String OR Int IDs into a Sendable String?
-        let reqId: String? =
-            (json["id"] as? String) ?? (json["id"] as? Int).map(String.init)
+        // Preserves the id's original JSON type so the response echoes it
+        // exactly. JSON-RPC 2.0 requires type-strict id matching: a numeric
+        // request id answered with a string is never correlated by strict
+        // clients (Android Studio times out and sends $/cancel_request).
+        let reqId: RPCID? = hasId ? json["id"].map(RPCID.init) : nil
 
         // A message with no method but an id is a response to a request the
         // agent sent to the client (fs/*, terminal/*). Route it to the
@@ -92,7 +94,9 @@ final class ACPServer: Sendable {
         if method.isEmpty, hasId {
             let answered = await clientChannel.handleIncoming(json)
             if !answered {
-                logger.debug("Unmatched client response id: \(reqId ?? "?")")
+                logger.debug(
+                    "Unmatched client response id: \(reqId.map { "\($0.value)" } ?? "?")"
+                )
             }
             return
         }
@@ -102,22 +106,26 @@ final class ACPServer: Sendable {
             handleInitialize(json: json, hasId: hasId, reqId: reqId)
         case "session/new":
             await handleNewSession(json: json, hasId: hasId, reqId: reqId)
+        case "session/load":
+            await handleLoadSession(json: json, hasId: hasId, reqId: reqId)
         case "session/prompt":
             await handlePrompt(json: json, hasId: hasId, reqId: reqId)
+        case "session/delete":
+            await handleDeleteSession(json: json, hasId: hasId, reqId: reqId)
         case "session/cancel":
-            handleCancel(json: json)
+            await handleCancel(json: json)
         default:
             if hasId, let reqId {
                 sendJSON([
                     "jsonrpc": "2.0",
-                    "id": reqId,
+                    "id": reqId.value,
                     "result": [:],
                 ])
             }
         }
     }
 
-    private func handleInitialize(json: [String: Any], hasId: Bool, reqId: String?) {
+    private func handleInitialize(json: [String: Any], hasId: Bool, reqId: RPCID?) {
         guard hasId, let reqId else { return }
 
         // Negotiate the client capabilities that gate the native ACP tools
@@ -146,10 +154,17 @@ final class ACPServer: Sendable {
 
         sendJSON([
             "jsonrpc": "2.0",
-            "id": reqId,
+            "id": reqId.value,
             "result": [
                 "protocolVersion": 1,
-                "agentCapabilities": ["loadSession": false],
+                "agentCapabilities": [
+                    "loadSession": true,
+                    // Per the ACP spec, session capability markers must be
+                    // JSON objects: "delete": {} advertises session/delete
+                    // support. An empty array is a type mismatch that strict
+                    // clients (Android Studio) fail to deserialize.
+                    "sessionCapabilities": ["delete": [:]],
+                ],
                 "agentInfo": ["name": "TerrapinPilot", "version": "1.0.0"],
                 "authMethods": [],
             ],
@@ -159,7 +174,7 @@ final class ACPServer: Sendable {
     private func handleNewSession(
         json: [String: Any],
         hasId: Bool,
-        reqId: String?
+        reqId: RPCID?
     ) async {
         guard hasId, let reqId else { return }
         let params = json["params"] as? [String: Any]
@@ -171,15 +186,12 @@ final class ACPServer: Sendable {
         }
 
         // Xcode-only setup: spawn the mcpbridge and register its tools the
-        // first time an Xcode session is created.
-        if clientKind == .xcode, !xcodeBridgeReady {
-            xcodeBridgeReady = true
-            await setupXcodeBridge()
-        }
+        // first time an Xcode session is created or loaded.
+        await ensureXcodeBridge()
 
         sendJSON([
             "jsonrpc": "2.0",
-            "id": reqId,
+            "id": reqId.value,
             "result": ["sessionId": newSessionId],
         ])
     }
@@ -199,15 +211,126 @@ final class ACPServer: Sendable {
         logger.debug("Xcode MCP bridge ready with \(bridgeTools.count) tools")
     }
 
-    private func handlePrompt(
+    /// Spawns the Xcode MCP bridge on first use (session/new or session/load)
+    /// for Xcode clients.
+    private func ensureXcodeBridge() async {
+        guard clientKind == .xcode, !xcodeBridgeReady else { return }
+        xcodeBridgeReady = true
+        await setupXcodeBridge()
+    }
+
+    /// Handles session/load: restores a persisted session and replays its
+    /// conversation to the client as session/update notifications, per the
+    /// ACP spec. The response is sent only after the replay is complete.
+    private func handleLoadSession(
         json: [String: Any],
         hasId: Bool,
-        reqId: String?
+        reqId: RPCID?
     ) async {
         guard hasId, let reqId else { return }
         let params = json["params"] as? [String: Any]
         let sessionId = params?["sessionId"] as? String ?? ""
-        let userPrompt = Self.extractParam(params, key: "prompt")
+        let clientCwd = Self.extractParam(params, key: "cwd")
+
+        guard !sessionId.isEmpty else {
+            sendError(reqId: reqId, code: -32602, message: "Missing sessionId")
+            return
+        }
+
+        guard await sessionStore.loadSession(for: sessionId) else {
+            sendError(
+                reqId: reqId,
+                code: -32002,
+                message: "Session not found: \(sessionId)"
+            )
+            return
+        }
+
+        // Fall back to the client-provided cwd when the stored session has none.
+        if await sessionStore.getCWD(for: sessionId) == nil, !clientCwd.isEmpty {
+            await sessionStore.setCWD(clientCwd, for: sessionId)
+        }
+
+        await ensureXcodeBridge()
+
+        // Replay the conversation so the client can display it. Tool calls
+        // and tool results are not replayed; the full history is retained
+        // server-side for the model's context.
+        if let history = await sessionStore.history(for: sessionId) {
+            for message in history {
+                switch message.role {
+                case "user":
+                    if let text = message.content, !text.isEmpty {
+                        sendJSON([
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": [
+                                "sessionId": sessionId,
+                                "update": [
+                                    "sessionUpdate": "user_message_chunk",
+                                    "content": [
+                                        "type": "text",
+                                        "text": text,
+                                    ],
+                                ],
+                            ],
+                        ])
+                    }
+                case "assistant":
+                    if let thought = message.reasoning, !thought.isEmpty {
+                        sendThoughtChunk(sessionId: sessionId, text: thought)
+                    }
+                    if let text = message.content, !text.isEmpty {
+                        sendChunk(sessionId: sessionId, text: text)
+                    }
+                default:
+                    break
+                }
+            }
+        }
+
+        sendJSON([
+            "jsonrpc": "2.0",
+            "id": reqId.value,
+            "result": ["sessionId": sessionId],
+        ])
+    }
+
+    /// Handles session/delete: removes the persisted session. Per the ACP
+    /// spec, deleting an unknown or already-deleted session succeeds silently.
+    private func handleDeleteSession(
+        json: [String: Any],
+        hasId: Bool,
+        reqId: RPCID?
+    ) async {
+        guard hasId, let reqId else { return }
+        let params = json["params"] as? [String: Any]
+        let sessionId = params?["sessionId"] as? String ?? ""
+
+        guard !sessionId.isEmpty else {
+            sendError(reqId: reqId, code: -32602, message: "Missing sessionId")
+            return
+        }
+
+        await sessionStore.deleteSession(for: sessionId)
+        releaseLeakedTerminals(for: sessionId)
+
+        sendJSON([
+            "jsonrpc": "2.0",
+            "id": reqId.value,
+            "result": [:],
+        ])
+    }
+
+    private func handlePrompt(
+        json: [String: Any],
+        hasId: Bool,
+        reqId: RPCID?
+    ) async {
+        guard hasId, let reqId else { return }
+        let params = json["params"] as? [String: Any]
+        let sessionId = params?["sessionId"] as? String ?? ""
+        let userPrompt = Self.sanitizeXcodePrompt(Self.extractParam(params, key: "prompt"))
 
         // Resolve working directory (fallback to standard user home directory)
         let cwd =
@@ -241,7 +364,7 @@ final class ACPServer: Sendable {
             let stopReason = Task.isCancelled ? "cancelled" : "end_turn"
             self.sendJSON([
                 "jsonrpc": "2.0",
-                "id": reqId,
+                "id": reqId.value,
                 "result": [
                     "stopReason": stopReason
                 ],
@@ -261,12 +384,31 @@ final class ACPServer: Sendable {
     /// Handles the session/cancel notification: stops the in-flight prompt
     /// turn for the session. Sends no response (it is a notification); the
     /// original session/prompt request is answered with "cancelled".
-    private func handleCancel(json: [String: Any]) {
+    private func handleCancel(json: [String: Any]) async {
         let params = json["params"] as? [String: Any]
         let sessionId = params?["sessionId"] as? String ?? ""
 
         taskLock.withLock {
             promptTasks[sessionId]?.task?.cancel()
+        }
+
+        releaseLeakedTerminals(for: sessionId)
+    }
+
+    /// Releases any terminals the session still holds. A cancelled or
+    /// deleted turn never gets to terminal_release them itself, and the ACP
+    /// spec makes the agent responsible for releasing terminals.
+    ///
+    /// Runs detached: the stdin loop must keep reading so the client's
+    /// responses to the release requests can be routed back to the awaiting
+    /// ClientChannel callers (awaiting them inline would block the loop
+    /// until every request timed out).
+    private func releaseLeakedTerminals(for sessionId: String) {
+        Task.detached { [clientTools, logger] in
+            let released = await clientTools.releaseAllTerminals(for: sessionId)
+            if released > 0 {
+                logger.debug("Released \(released) leaked terminal(s) for session \(sessionId)")
+            }
         }
     }
 
@@ -280,6 +422,18 @@ final class ACPServer: Sendable {
     }
 
     // MARK: - Output
+
+    /// Sends a JSON-RPC error response for a request.
+    private func sendError(reqId: RPCID, code: Int, message: String) {
+        sendJSON([
+            "jsonrpc": "2.0",
+            "id": reqId.value,
+            "error": [
+                "code": code,
+                "message": message,
+            ],
+        ])
+    }
 
     private func sendJSON(_ dictionary: [String: Any]) {
         stdoutLock.lock()
@@ -329,6 +483,17 @@ final class ACPServer: Sendable {
 
     // MARK: - Helpers
 
+    /// Xcode prepends a "Project structure" block to prompts that instructs
+    /// the model to use XcodeRead/XcodeWrite/XcodeGrep/XcodeGlob to interact
+    /// with files. We expose native ACP file tools instead, so strip that
+    /// instruction to keep the model from calling tools it cannot reach.
+    private static func sanitizeXcodePrompt(_ prompt: String) -> String {
+        prompt.replacing(
+            ". Use XcodeRead, XcodeWrite, XcodeGrep, and XcodeGlob to interact with these files):",
+            with: "):"
+        )
+    }
+
     /// Extracts a prompt string or path parameter from ACP params.
     private static func extractParam(_ params: [String: Any]?, key: String) -> String {
         guard let params = params else { return "" }
@@ -348,4 +513,14 @@ final class ACPServer: Sendable {
 /// and only read under ACPServer's taskLock.
 private final class PromptTaskBox: @unchecked Sendable {
     var task: Task<Void, Never>?
+}
+
+/// Wraps a JSON-RPC request id, preserving its original JSON type so the
+/// response echoes it exactly. JSON-RPC 2.0 requires type-strict id
+/// matching: a numeric request id answered with a string is never
+/// correlated by strict clients (Android Studio times out and sends
+/// $/cancel_request). The wrapped value is an immutable JSON value
+/// (String or NSNumber), so unchecked Sendable is sound.
+private struct RPCID: @unchecked Sendable {
+    let value: Any
 }

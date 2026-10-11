@@ -8,7 +8,7 @@
 import Foundation
 import Stores
 
-public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
+public final class ACPClientTools: ToolProvider, @unchecked Sendable {
     let clientChannel: ClientChannel
     let xcodeBridge: XcodeMCPBridgeClient?
     private let lock = NSLock()
@@ -205,7 +205,7 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                     ]),
                     "pathPattern": AnySendable([
                         "type": AnySendable("string"),
-                        "description": AnySendable("Optional glob filter (e.g. '*.swift', 'Sources/*').")
+                        "description": AnySendable("Optional glob filter on file paths (e.g. '*.swift', 'Sources/*'). Patterns without '/' match the file name; patterns with '/' match the path relative to the workspace root. '*' does not cross directory boundaries; use '**' to match across directories.")
                     ]),
                     "caseSensitive": AnySendable([
                         "type": AnySendable("boolean"),
@@ -694,7 +694,7 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                 ]
             ])
             
-            return "File written successfully: \(path)"
+            return "File edited successfully: \(path)"
         case .error(let message):
             sendJSON([
                 "jsonrpc": "2.0",
@@ -1106,6 +1106,8 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             "sessionId": sessionId,
             "command": command,
             "outputByteLimit": 1_048_576,
+            "args": [String](),
+            "env": [[String: String]]()
         ]
         if !cwd.isEmpty {
             params["cwd"] = cwd
@@ -1566,6 +1568,22 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         caseSensitive: Bool,
         isRegex: Bool
     ) async -> (matches: [String], locations: [[String: Any]], cmd: String) {
+        // grep --include only matches file basenames, so a pattern with a
+        // directory component (e.g. "Sources/*") can never match. Enumerate
+        // the workspace instead and grep the files whose relative path
+        // matches the glob.
+        var searchTargets = [cwd]
+        if let pattern = pathPattern, !pattern.isEmpty, pattern.contains("/") {
+            searchTargets = Self.filesMatchingGlob(pattern, under: cwd)
+            if searchTargets.isEmpty {
+                return (
+                    ["No files match path pattern '\(pattern)'."],
+                    [],
+                    "grep (no files match '\(pattern)')"
+                )
+            }
+        }
+        
         let process = Process()
         let pipe = Pipe()
         
@@ -1590,16 +1608,23 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         }
         
         if !caseSensitive { arguments.append("-i") }
-        if let pattern = pathPattern, !pattern.isEmpty {
+        if let pattern = pathPattern, !pattern.isEmpty, !pattern.contains("/") {
             arguments.append(contentsOf: ["--include", pattern])
         }
-        arguments.append(contentsOf: ["-e", query, cwd])
+        arguments.append(contentsOf: ["-e", query])
+        arguments.append(contentsOf: searchTargets)
         
         process.arguments = arguments
         process.standardOutput = pipe
         
-        let fullCommandArray = ["grep"] + (process.arguments ?? [])
-        let commandString = fullCommandArray.joined(separator: " ")
+        // A long explicit file list makes for an unreadable title, so show
+        // the glob instead when the search was narrowed to matched files.
+        let commandString: String
+        if searchTargets.count > 1, let pattern = pathPattern {
+            commandString = "grep \(isRegex ? "-E" : "-F")\(caseSensitive ? "" : " -i") -e \(query) [\(searchTargets.count) files matching '\(pattern)']"
+        } else {
+            commandString = (["grep"] + (process.arguments ?? [])).joined(separator: " ")
+        }
         
         do {
             try process.run()
@@ -1637,6 +1662,74 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         } catch {
             return (["Grep execution failed: \(error.localizedDescription)"], [], commandString)
         }
+    }
+    
+    /// Enumerates the regular files under `directory` (skipping .git, .build
+    /// and DerivedData) whose path relative to `directory` matches the glob
+    /// `pattern`.
+    private static func filesMatchingGlob(_ pattern: String, under directory: String) -> [String] {
+        let fileManager = FileManager.default
+        let rootURL = URL(fileURLWithPath: directory).standardizedFileURL
+        let excludedDirectories: Set<String> = [".git", ".build", "DerivedData"]
+        
+        guard let enumerator = fileManager.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey, .isDirectoryKey]
+        ) else {
+            return []
+        }
+        
+        var matches: [String] = []
+        for case let url as URL in enumerator {
+            let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
+            if values?.isRegularFile == true {
+                let fileURL = url.standardizedFileURL
+                guard fileURL.path.hasPrefix(rootURL.path + "/") else { continue }
+                let relativePath = String(fileURL.path.dropFirst(rootURL.path.count + 1))
+                if globMatches(pattern, path: relativePath) {
+                    matches.append(fileURL.path)
+                }
+            } else if values?.isDirectory == true, excludedDirectories.contains(url.lastPathComponent) {
+                enumerator.skipDescendants()
+            }
+        }
+        return matches
+    }
+    
+    /// Matches `path` against a shell-style glob: `*` matches any run of
+    /// characters except `/`, `**` matches anything including `/`, `?`
+    /// matches a single character except `/`, and every other character is
+    /// literal.
+    private static func globMatches(_ pattern: String, path: String) -> Bool {
+        guard let regex = globRegex(for: pattern) else { return false }
+        return regex.firstMatch(in: path, range: NSRange(path.startIndex..., in: path)) != nil
+    }
+    
+    private static func globRegex(for pattern: String) -> NSRegularExpression? {
+        var source = "^"
+        var index = pattern.startIndex
+        while index < pattern.endIndex {
+            let character = pattern[index]
+            switch character {
+            case "*":
+                let next = pattern.index(after: index)
+                if next < pattern.endIndex, pattern[next] == "*" {
+                    source += ".*"
+                    index = pattern.index(after: next)
+                } else {
+                    source += "[^/]*"
+                    index = next
+                }
+            case "?":
+                source += "[^/]"
+                index = pattern.index(after: index)
+            default:
+                source += NSRegularExpression.escapedPattern(for: String(character))
+                index = pattern.index(after: index)
+            }
+        }
+        source += "$"
+        return try? NSRegularExpression(pattern: source)
     }
     
     private func runListDirectory(_ path: String) -> String {

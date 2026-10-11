@@ -34,8 +34,10 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         "BuildProject",
         "GetBuildLog",
         "XcodeListNavigatorIssues",
+        "XcodeRefreshCodeIssuesInFile",
         "RunSomeTests",
         "RunAllTests",
+        "RunCodeSnippet",
         "RenderPreview",
         "DocumentationSearch",
         "XcodeOpenWorkspace"
@@ -474,19 +476,23 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private func categorizeMCPTool(name: String, argsJSON: String) -> (kind: String, title: String) {
         switch name {
         case "BuildProject":
-            return ("execute", "Building Project")
+            return ("execute", name)
         case "XcodeClean":
-            return ("execute", "Cleaning Build Folder")
+            return ("execute", name)
         case "RunSomeTests", "RunAllTests":
-            return ("execute", "Running Unit Tests")
+            return ("execute", name)
+        case "RunCodeSnippet":
+            return ("execute", "Running Code Snippet")
         case "DocumentationSearch":
-            return ("search", "Searching Apple Documentation")
+            return ("other", "Searching Apple Documentation")
         case "GetBuildLog", "XcodeListNavigatorIssues":
-            return ("search", "Fetching Xcode Diagnostics")
+            return ("other", "Fetching Xcode Diagnostics with \(name)")
+        case "XcodeRefreshCodeIssuesInFile":
+            return ("other", "Refreshing Code Issues")
         case "RenderPreview":
-            return ("execute", "Rendering SwiftUI Preview")
+            return ("other", "Rendering SwiftUI Preview")
         default:
-            return ("execute", "Running \(name)")
+            return ("execute", name)
         }
     }
     

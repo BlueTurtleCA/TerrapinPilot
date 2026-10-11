@@ -20,6 +20,7 @@ Xcode  ⇄  (ACP / JSON-RPC)  ⇄  TerrapinPilot  ⇄  (OpenAI-compatible HTTP) 
 - **Stream** answer and thinking tokens to Xcode as they are generated.
 - **Stay within the model's context window** by auto-detecting the server's context length and compacting older history when it gets close.
 - **Reuse the server's KV cache** by pinning each session to a stable slot (llama.cpp), so follow-up turns only process the delta.
+- **Resume previous sessions** — session state (working directory + chat history) is persisted to `~/.terrapinpilot/sessions/`, so `session/load` restores a conversation after a restart. Sessions not updated for 30 days are removed automatically on startup.
 - **Pick up project instructions** from an `AGENTS.md` file in the working directory.
 
 ## How it works
@@ -63,7 +64,7 @@ TerrapinPilot is configured with CLI arguments, which take precedence over envir
 | `--model` | `AI_MODEL` | `default` | Model name sent in each chat-completion request. |
 | `--context-window` | `AI_CONTEXT_WINDOW` | auto-detected | Override the context window size (in tokens). By default it is read from the server's `/v1/models` endpoint. |
 | `--slots` | `AI_SLOTS` | `1` | Number of server-side context slots (llama.cpp `-np` / `n_parallel`). Sessions are pinned to a slot so the KV cache is reused across turns. |
-| `--debug-log` | `AI_DEBUG_LOG` | `false` | Write each request body to `/tmp/terrapinpilot-llm/NNNN.json` for prefix-stability debugging. |
+| `--debug-log` | `AI_DEBUG_LOG` | `false` | Write each request body to `~/.terrapinpilot/logs/NNNN.json` for prefix-stability debugging. |
 | `--default-client` | `AI_DEFAULT_CLIENT` | `xcode` | Client assumed when the connecting ACP client does not identify itself (`xcode` or `generic`). |
 
 One additional, optional variable:
@@ -96,6 +97,8 @@ TerrapinPilot reads one JSON-RPC message per line from `stdin` and writes JSON-R
 | --- | --- |
 | `initialize` | Returns the protocol version, agent capabilities, and agent info. |
 | `session/new` | Creates a session (returns a `sessionId`) and records the working directory. |
+| `session/load` | Restores a persisted session and replays its conversation as `session/update` notifications, then returns. |
+| `session/delete` | Removes a persisted session. Deleting an unknown session succeeds silently. |
 | `session/prompt` | Runs an agent turn, streaming `session/update` notifications (`agent_message_chunk`, `agent_thought_chunk`), then returns `stopReason: end_turn`. |
 | `session/cancel` | Returns `stopReason: cancelled`. |
 
@@ -117,6 +120,24 @@ To test that TerrapinPilot can successfully connect with the AI server, enter th
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
 {"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"sessionId":"debug1","cwd":"/tmp","prompt":"Reply with exactly: one"}}
 {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"debug1","prompt":"Reply with exactly: two"}}
+```
+
+### `/debug` command
+
+To replay raw JSON to the ACP client without involving the model, send `/debug <file>` as a prompt. The file holds one JSON object per `---`-delimited block, and each object is passed straight through `sendJSON` to the client (the session history is left untouched):
+
+```
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": { "sessionId": "debug1", "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hello" } } }
+}
+---
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": { "sessionId": "debug1", "update": { "sessionUpdate": "agent_thought_chunk", "content": { "type": "text", "text": "thinking..." } } }
+}
 ```
 
 ## Project structure

@@ -18,7 +18,7 @@ public struct WebTools: ToolProvider {
         ToolDefinition(
             function: FunctionDefinition(
                 name: "web_fetch",
-                description: "Fetches and converts the text content of any HTTP/HTTPS URL into readable plain text. Content larger than ~30KB is saved to .terrapin/web/ in the workspace and a preview is returned; use grep_file or read_file on the saved path to inspect the full content.",
+                description: "Fetches and converts the text content of any HTTP/HTTPS URL into readable plain text. Content larger than ~30KB is saved to .terrapinpilot/web/ in the workspace and a preview is returned; use grep_file or read_file on the saved path to inspect the full content.",
                 parameters: [
                     "type": AnySendable("object"),
                     "properties": AnySendable([
@@ -62,8 +62,7 @@ public struct WebTools: ToolProvider {
         let callId = UUID().uuidString
         
         let info = args["url"] != nil ? args["url"] as! String : args["query"] as! String
-        let title = name == "web_search" ? "Searching for '\(info)'" : "Fetching \(info)"
-        let kind = name == "web_search" ? "search" : "fetch"
+        let title = name == "web_search" ? "Searching for '\(info)'" : "Fetching URL \(info)"
         
         sendJSON([
             "jsonrpc": "2.0",
@@ -73,12 +72,8 @@ public struct WebTools: ToolProvider {
                 "update": [
                     "sessionUpdate": "tool_call",
                     "toolCallId": callId,
-                    "name": name,
                     "title": title,
-                    "kind": kind,
                     "status": "in_progress",
-                    // Xcode renders rawInput to show what the tool is working on.
-                    "rawInput": args
                 ]
             ]
         ])
@@ -93,17 +88,7 @@ public struct WebTools: ToolProvider {
                 "update": [
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": callId,
-                    "status": response.starts(with: "Error") ? "failed" : "completed",
-                    // Spec shape: each ToolCallContent wraps a ContentBlock.
-                    "content": [
-                        [
-                            "type": "content",
-                            "content": [
-                                "type": "text",
-                                "text": response
-                            ]
-                        ]
-                    ]
+                    "status": response.starts(with: "Error") ? "failed" : "completed"
                 ]
             ]
         ])
@@ -141,8 +126,8 @@ public struct WebTools: ToolProvider {
     // MARK: - Core Web Implementations
     
     /// Fetches HTML from a web page and strips tags/scripts into plain text.
-    /// Content larger than `inlineLimit` is saved under `.terrapin/web/` in
-    /// the workspace and a pointer + preview is returned instead, so the
+    /// Content larger than `inlineLimit` is saved under `.terrapinpilot/web/`
+    /// in the workspace and a pointer + preview is returned instead, so the
     /// model can grep_file/read_file the full content on demand.
     private static func fetchURL(_ urlString: String, cwd: String) async -> String {
         guard let url = URL(string: urlString) else {
@@ -186,11 +171,11 @@ public struct WebTools: ToolProvider {
         }
     }
     
-    /// Writes `text` to `.terrapin/web/` in the workspace using a
+    /// Writes `text` to `.terrapinpilot/web/` in the workspace using a
     /// deterministic name derived from the URL, so re-fetching the same URL
     /// overwrites the same file. Returns the workspace-relative path.
     private static func saveToWorkspace(text: String, urlString: String, cwd: String) -> String? {
-        let directory = (cwd as NSString).appendingPathComponent(".terrapin/web")
+        let directory = TerrapinPaths.webCacheDirectory(in: cwd)
         do {
             try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         } catch { return nil }
