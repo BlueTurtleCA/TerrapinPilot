@@ -9,18 +9,27 @@ import Foundation
 import Stores
 
 public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
-    let acpClientTools: ACPClientTools
     let clientChannel: ClientChannel
     let xcodeBridge: XcodeMCPBridgeClient?
+    private let lock = NSLock()
+    private var capabilities = Capabilities()
+    // Terminals still alive per session (created but not yet released), so
+    // they can be released on session/cancel or session/delete.
+    private var activeTerminals: [String: Set<String>] = [:]
     
     enum ACPError: Error {
         case message(String)
     }
     
     public init(clientChannel: ClientChannel, xcodeBridge: XcodeMCPBridgeClient? = nil) {
-        self.acpClientTools = ACPClientTools(channel: clientChannel)
         self.clientChannel = clientChannel
         self.xcodeBridge = xcodeBridge
+    }
+    
+    private var currentCapabilities: Capabilities {
+        lock.lock()
+        defer { lock.unlock() }
+        return capabilities
     }
     
     public func definitions() async -> [ToolDefinition] {
@@ -32,6 +41,9 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         tools.append(Self.moveFileDefinition)
         tools.append(Self.deleteFileDefinition)
         tools.append(Self.listDirectoryDefinition)
+        if currentCapabilities.terminal {
+            tools.append(contentsOf: Self.terminalDefinitions)
+        }
         return tools
     }
     
@@ -55,13 +67,58 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             return await deleteFile(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
         case "list_directory":
             return await listDirectory(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "run_command":
+            return await runCommand(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "terminal_create":
+            return await createTerminalTool(argsJSON: argsJSON, cwd: cwd, sessionId: sessionId, sendJSON: sendJSON)
+        case "terminal_output":
+            return await terminalOutput(argsJSON: argsJSON, sessionId: sessionId, sendJSON: sendJSON)
+        case "terminal_wait_for_exit":
+            return await terminalWaitForExit(argsJSON: argsJSON, sessionId: sessionId, sendJSON: sendJSON)
+        case "terminal_kill":
+            return await terminalKill(argsJSON: argsJSON, sessionId: sessionId, sendJSON: sendJSON)
+        case "terminal_release":
+            return await terminalRelease(argsJSON: argsJSON, sessionId: sessionId, sendJSON: sendJSON)
         default:
             return "Error: Unknown tool '\(name)'"
         }
     }
     
     public func updateCapabilities(_ capabilities: Capabilities) {
-        self.acpClientTools.updateCapabilities(capabilities)
+        lock.lock()
+        defer { lock.unlock() }
+        self.capabilities = capabilities
+    }
+    
+    /// Releases every terminal the session still holds and returns how many
+    /// were released. Used on session/cancel and session/delete: a cancelled
+    /// or deleted turn never gets to terminal_release its terminals itself,
+    /// and the ACP spec makes the agent responsible for releasing terminals.
+    /// Per the spec, terminal/release kills the command if it is still
+    /// running, so no separate kill is needed.
+    public func releaseAllTerminals(for sessionId: String) async -> Int {
+        let terminalIds = lock.withLock {
+            let ids = Array(activeTerminals[sessionId] ?? [])
+            activeTerminals[sessionId] = nil
+            return ids
+        }
+        
+        guard !terminalIds.isEmpty else { return 0 }
+        
+        // Released in parallel with a short deadline so an unresponsive
+        // client cannot stall the cleanup.
+        await withTaskGroup(of: Void.self) { group in
+            for terminalId in terminalIds {
+                group.addTask {
+                    _ = await self.clientChannel.request(
+                        method: "terminal/release",
+                        params: ["sessionId": sessionId, "terminalId": terminalId],
+                        timeout: 10
+                    )
+                }
+            }
+        }
+        return terminalIds.count
     }
     
     private static let readTextFileDefinition = ToolDefinition(
@@ -218,6 +275,135 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             ]
         )
     )
+    
+    private static let terminalDefinitions: [ToolDefinition] = [
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "run_command",
+                description: "Runs a shell command in a client terminal, waits for it to finish, and returns the exit status and output. Prefer this over Xcode MCP tools for shell commands (git, swift, xcodebuild, scripts, ...).",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "command": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The command to execute, e.g. 'git'.")
+                        ]),
+                        "args": AnySendable([
+                            "type": AnySendable("array"),
+                            "items": AnySendable(["type": AnySendable("string")]),
+                            "description": AnySendable("Command arguments as separate strings, e.g. [\"status\", \"-s\"].")
+                        ]),
+                        "cwd": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("Optional absolute working directory. Defaults to the session working directory.")
+                        ]),
+                        "env": AnySendable([
+                            "type": AnySendable("object"),
+                            "description": AnySendable("Optional environment variables as a key/value map.")
+                        ]),
+                        "timeoutSeconds": AnySendable([
+                            "type": AnySendable("integer"),
+                            "description": AnySendable("Optional maximum time to wait, in seconds (default 120, max 600). The command is killed when it elapses.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("command")])
+                ]
+            )
+        ),
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "terminal_create",
+                description: "Starts a command in a new client terminal and returns its terminalId. Use the other terminal tools with that id to observe, wait for, kill, or release it. Prefer run_command for one-shot commands.",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "command": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The command to execute, e.g. 'swift'.")
+                        ]),
+                        "args": AnySendable([
+                            "type": AnySendable("array"),
+                            "items": AnySendable(["type": AnySendable("string")]),
+                            "description": AnySendable("Command arguments as separate strings.")
+                        ]),
+                        "cwd": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("Optional absolute working directory. Defaults to the session working directory.")
+                        ]),
+                        "env": AnySendable([
+                            "type": AnySendable("object"),
+                            "description": AnySendable("Optional environment variables as a key/value map.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("command")])
+                ]
+            )
+        ),
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "terminal_output",
+                description: "Retrieves the current output of a terminal without waiting for the command to finish.",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "terminalId": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The id returned by terminal_create.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("terminalId")])
+                ]
+            )
+        ),
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "terminal_wait_for_exit",
+                description: "Waits until the command in a terminal finishes and returns its exit status.",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "terminalId": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The id returned by terminal_create.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("terminalId")])
+                ]
+            )
+        ),
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "terminal_kill",
+                description: "Kills the command running in a terminal without releasing it.",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "terminalId": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The id returned by terminal_create.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("terminalId")])
+                ]
+            )
+        ),
+        ToolDefinition(
+            function: FunctionDefinition(
+                name: "terminal_release",
+                description: "Releases a terminal that is no longer needed. Always release terminals you created.",
+                parameters: [
+                    "type": AnySendable("object"),
+                    "properties": AnySendable([
+                        "terminalId": AnySendable([
+                            "type": AnySendable("string"),
+                            "description": AnySendable("The id returned by terminal_create.")
+                        ])
+                    ]),
+                    "required": AnySendable([AnySendable("terminalId")])
+                ]
+            )
+        )
+    ]
     
     // MARK: - Filesystem Tools
 
@@ -542,7 +728,7 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         let isRegex = args["isRegex"] as? Bool ?? true
         
             
-        let (matches, _) = await runStandardGrep(
+        let (matches, _, commandString) = await runStandardGrep(
             query: query,
             cwd: cwd,
             pathPattern: pathPattern,
@@ -561,7 +747,7 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                     "sessionUpdate": "tool_call",
                     "toolCallId": callId,
                     "name": "grep_file",
-                    "title": "Grep searching for \(query)",
+                    "title": commandString,
                     "kind": "execute",
                     "status": "in_progress"
                 ]
@@ -577,6 +763,7 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                 "update": [
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": callId,
+                    "title": commandString,
                     "status": "completed"
                 ]
             ]
@@ -903,6 +1090,299 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         return result
     }
     
+    // MARK: - Terminal Tools
+
+    private enum CreatedTerminal {
+        case id(String)
+        case failure(String)
+    }
+
+    private func createTerminal(args: [String: Any], cwd: String, sessionId: String) async -> CreatedTerminal {
+        guard let command = args["command"] as? String, !command.isEmpty else {
+            return .failure("Error: Missing 'command' parameter")
+        }
+
+        var params: [String: Any] = [
+            "sessionId": sessionId,
+            "command": command,
+            "outputByteLimit": 1_048_576,
+        ]
+        if !cwd.isEmpty {
+            params["cwd"] = cwd
+        }
+        if let commandArgs = args["args"] as? [String], !commandArgs.isEmpty {
+            params["args"] = commandArgs
+        }
+        if let rawCwd = args["cwd"] as? String, !rawCwd.isEmpty {
+            params["cwd"] = Self.resolveWorkspacePath(relativePath: rawCwd, workspaceRoot: cwd)
+        }
+        if let env = args["env"] as? [String: Any], !env.isEmpty {
+            params["env"] = env.map { key, value in
+                ["name": key, "value": String(describing: value)]
+            }
+        }
+
+        switch await clientChannel.request(method: "terminal/create", params: params) {
+        case .result(let result):
+            guard let terminalId = result["terminalId"] as? String else {
+                return .failure("Error: Client did not return a terminalId")
+            }
+            trackTerminal(terminalId, in: sessionId)
+            return .id(terminalId)
+        case .error(let message):
+            return .failure("Error creating terminal: \(message)")
+        }
+    }
+
+    private func runCommand(argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let args = Self.parseArgs(argsJSON) else {
+            return "Error: Invalid JSON parameters supplied to run_command"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        let title = Self.commandTitle(args)
+
+        let created = await createTerminal(args: args, cwd: cwd, sessionId: sessionId)
+        guard case .id(let terminalId) = created else {
+            if case .failure(let message) = created {
+                Self.sendToolCall(sessionId: sessionId, callId: callId, name: "run_command", title: title, status: "in_progress", sendJSON: sendJSON)
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+                return message
+            }
+            return "Error: Failed to create terminal"
+        }
+
+        // Embed the terminal in the tool call so the client displays live
+        // output as it is generated (ACP spec: Terminals > Embedding in
+        // Tool Calls).
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "run_command",
+            title: title,
+            status: "in_progress",
+            terminalId: terminalId,
+            sendJSON: sendJSON
+        )
+
+        let timeout = min(max((args["timeoutSeconds"] as? Int) ?? 120, 1), 600)
+
+        // ACP's terminal/wait_for_exit has no timeout of its own, so race it
+        // against a local deadline: a hung command must not hang the agent.
+        // The channel request gets a longer deadline than the race so the
+        // race (not the channel) decides when the command has timed out.
+        let exitResponse: ClientChannel.ClientResponse? = await withTaskGroup(
+            of: ClientChannel.ClientResponse?.self
+        ) { group in
+            group.addTask {
+                await self.clientChannel.request(
+                    method: "terminal/wait_for_exit",
+                    params: ["sessionId": sessionId, "terminalId": terminalId],
+                    timeout: Double(timeout) + 30
+                )
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout) * 1_000_000_000)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+
+        var statusLine: String
+        var finalStatus: String
+        switch exitResponse {
+        case nil:
+            _ = await clientChannel.request(
+                method: "terminal/kill",
+                params: ["sessionId": sessionId, "terminalId": terminalId]
+            )
+            statusLine = "Command timed out after \(timeout)s and was killed."
+            finalStatus = "failed"
+        case .some(.result(let result)):
+            // Per the ACP spec, terminal/wait_for_exit responds with a flat
+            // {exitCode, signal} object; the nested exitStatus shape belongs
+            // to terminal/output.
+            statusLine = Self.describeExitStatus(result)
+            // Exit code 0 (or no status at all) counts as completed; a
+            // non-zero code or a terminating signal counts as failed.
+            if let exitCode = result["exitCode"] as? Int {
+                finalStatus = exitCode == 0 ? "completed" : "failed"
+            } else {
+                finalStatus = (result["signal"] as? String) == nil ? "completed" : "failed"
+            }
+        case .some(.error(let message)):
+            statusLine = "Error waiting for the command to exit: \(message)"
+            finalStatus = "failed"
+        }
+
+        var output = ""
+        switch await clientChannel.request(
+            method: "terminal/output",
+            params: ["sessionId": sessionId, "terminalId": terminalId]
+        ) {
+        case .result(let result):
+            output = (result["output"] as? String) ?? ""
+            if (result["truncated"] as? Bool) == true {
+                output = "[output truncated]\n" + output
+            }
+        case .error(let message):
+            output = "[failed to read terminal output: \(message)]"
+        }
+
+        _ = await clientChannel.request(
+            method: "terminal/release",
+            params: ["sessionId": sessionId, "terminalId": terminalId]
+        )
+        untrackTerminal(terminalId, in: sessionId)
+
+        Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: finalStatus, sendJSON: sendJSON)
+
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? statusLine : statusLine + "\n" + trimmed
+    }
+
+    private func createTerminalTool(argsJSON: String, cwd: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let args = Self.parseArgs(argsJSON) else {
+            return "Error: Invalid JSON parameters supplied to terminal_create"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        let title = Self.commandTitle(args)
+
+        switch await createTerminal(args: args, cwd: cwd, sessionId: sessionId) {
+        case .id(let terminalId):
+            // Embed the terminal in the tool call so the client displays
+            // live output for the lifetime of the terminal.
+            Self.sendToolCall(
+                sessionId: sessionId,
+                callId: callId,
+                name: "terminal_create",
+                title: title,
+                status: "in_progress",
+                terminalId: terminalId,
+                sendJSON: sendJSON
+            )
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+            return "Terminal created: \(terminalId)"
+        case .failure(let message):
+            Self.sendToolCall(sessionId: sessionId, callId: callId, name: "terminal_create", title: title, status: "in_progress", sendJSON: sendJSON)
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            return message
+        }
+    }
+
+    private func terminalOutput(argsJSON: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let terminalId = Self.terminalId(from: argsJSON) else {
+            return "Error: Missing 'terminalId' parameter"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        Self.sendToolCall(sessionId: sessionId, callId: callId, name: "terminal_output", title: "Reading output of \(terminalId)", status: "in_progress", sendJSON: sendJSON)
+
+        switch await clientChannel.request(
+            method: "terminal/output",
+            params: ["sessionId": sessionId, "terminalId": terminalId]
+        ) {
+        case .result(let result):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+            var text = (result["output"] as? String) ?? ""
+            if (result["truncated"] as? Bool) == true {
+                text = "[output truncated]\n" + text
+            }
+            if let status = result["exitStatus"] as? [String: Any] {
+                text += "\n" + Self.describeExitStatus(status)
+            }
+            return text.isEmpty ? "(no output yet)" : text
+        case .error(let message):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            return "Error reading terminal output: \(message)"
+        }
+    }
+
+    private func terminalWaitForExit(argsJSON: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let terminalId = Self.terminalId(from: argsJSON) else {
+            return "Error: Missing 'terminalId' parameter"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        Self.sendToolCall(sessionId: sessionId, callId: callId, name: "terminal_wait_for_exit", title: "Waiting for \(terminalId) to exit", status: "in_progress", sendJSON: sendJSON)
+
+        // Long-running commands (builds, test suites) can take far longer
+        // than the channel's default 120 s deadline.
+        switch await clientChannel.request(
+            method: "terminal/wait_for_exit",
+            params: ["sessionId": sessionId, "terminalId": terminalId],
+            timeout: 3600
+        ) {
+        case .result(let result):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+            return Self.describeExitStatus(result)
+        case .error(let message):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            return "Error waiting for terminal exit: \(message)"
+        }
+    }
+
+    private func terminalKill(argsJSON: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let terminalId = Self.terminalId(from: argsJSON) else {
+            return "Error: Missing 'terminalId' parameter"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        Self.sendToolCall(sessionId: sessionId, callId: callId, name: "terminal_kill", title: "Killing \(terminalId)", status: "in_progress", sendJSON: sendJSON)
+
+        switch await clientChannel.request(
+            method: "terminal/kill",
+            params: ["sessionId": sessionId, "terminalId": terminalId]
+        ) {
+        case .result:
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+            return "Terminal \(terminalId) killed."
+        case .error(let message):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            return "Error killing terminal: \(message)"
+        }
+    }
+
+    private func terminalRelease(argsJSON: String, sessionId: String, sendJSON: ([String: Any]) -> Void) async -> String {
+        guard let terminalId = Self.terminalId(from: argsJSON) else {
+            return "Error: Missing 'terminalId' parameter"
+        }
+
+        let callId = "call_" + UUID().uuidString
+        Self.sendToolCall(sessionId: sessionId, callId: callId, name: "terminal_release", title: "Releasing \(terminalId)", status: "in_progress", sendJSON: sendJSON)
+
+        switch await clientChannel.request(
+            method: "terminal/release",
+            params: ["sessionId": sessionId, "terminalId": terminalId]
+        ) {
+        case .result:
+            untrackTerminal(terminalId, in: sessionId)
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+            return "Terminal \(terminalId) released."
+        case .error(let message):
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            return "Error releasing terminal: \(message)"
+        }
+    }
+    
+    private func trackTerminal(_ terminalId: String, in sessionId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        activeTerminals[sessionId, default: []].insert(terminalId)
+    }
+    
+    private func untrackTerminal(_ terminalId: String, in sessionId: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        activeTerminals[sessionId]?.remove(terminalId)
+        if activeTerminals[sessionId]?.isEmpty == true {
+            activeTerminals[sessionId] = nil
+        }
+    }
+    
     private func internalReadTextFile(clientChannel: ClientChannel, sessionId: String, path: String) async throws -> String {
         do {            
             do {
@@ -997,13 +1477,95 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
     
+    private static func terminalId(from argsJSON: String) -> String? {
+        parseArgs(argsJSON)?["terminalId"] as? String
+    }
+    
+    private static func describeExitStatus(_ status: [String: Any]?) -> String {
+        guard let status else { return "Command finished." }
+        if let code = status["exitCode"] as? Int {
+            return code == 0
+                ? "Command finished with exit code 0."
+                : "Command failed with exit code \(code)."
+        }
+        if let signal = status["signal"] as? String {
+            return "Command terminated by signal \(signal)."
+        }
+        return "Command finished."
+    }
+    
+    /// Builds a human-readable command line (e.g. "git status -s") for use
+    /// as a tool call title.
+    private static func commandTitle(_ args: [String: Any]) -> String {
+        let command = args["command"] as? String ?? "command"
+        if let commandArgs = args["args"] as? [String], !commandArgs.isEmpty {
+            return command + " " + commandArgs.joined(separator: " ")
+        }
+        return command
+    }
+    
+    /// Emits a tool_call session/update. When terminalId is provided the
+    /// terminal is embedded in the tool call so the client displays its
+    /// live output (ACP spec: Terminals > Embedding in Tool Calls).
+    private static func sendToolCall(
+        sessionId: String,
+        callId: String,
+        name: String,
+        title: String,
+        status: String,
+        terminalId: String? = nil,
+        sendJSON: ([String: Any]) -> Void
+    ) {
+        var update: [String: Any] = [
+            "sessionUpdate": "tool_call",
+            "toolCallId": callId,
+            "name": name,
+            "title": title,
+            "kind": "execute",
+            "status": status,
+        ]
+        if let terminalId {
+            update["content"] = [
+                ["type": "terminal", "terminalId": terminalId]
+            ]
+        }
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": update,
+            ]
+        ])
+    }
+    
+    private static func sendToolCallUpdate(
+        sessionId: String,
+        callId: String,
+        status: String,
+        sendJSON: ([String: Any]) -> Void
+    ) {
+        sendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": callId,
+                    "status": status,
+                ]
+            ]
+        ])
+    }
+    
     private func runStandardGrep(
         query: String,
         cwd: String,
         pathPattern: String?,
         caseSensitive: Bool,
         isRegex: Bool
-    ) async -> (matches: [String], locations: [[String: Any]]) {
+    ) async -> (matches: [String], locations: [[String: Any]], cmd: String) {
         let process = Process()
         let pipe = Pipe()
         
@@ -1036,13 +1598,16 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
         process.arguments = arguments
         process.standardOutput = pipe
         
+        let fullCommandArray = ["grep"] + (process.arguments ?? [])
+        let commandString = fullCommandArray.joined(separator: " ")
+        
         do {
             try process.run()
             process.waitUntilExit()
             
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             guard let output = String(data: data, encoding: .utf8) else {
-                return ([], [])
+                return ([], [], commandString)
             }
             
             var matches: [String] = []
@@ -1068,9 +1633,9 @@ public final class ACPWrapperTools: ToolProvider, @unchecked Sendable {
                 }
             }
             
-            return (matches, locations)
+            return (matches, locations, commandString)
         } catch {
-            return (["Grep execution failed: \(error.localizedDescription)"], [])
+            return (["Grep execution failed: \(error.localizedDescription)"], [], commandString)
         }
     }
     
