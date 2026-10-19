@@ -6,11 +6,15 @@
 //
 
 import Foundation
+import Helpers
 import Stores
 
 public struct WebTools: ToolProvider {
+    private let monitor: NetworkMonitor
 
-    public init() {}
+    public init(monitor: NetworkMonitor = .shared) {
+        self.monitor = monitor
+    }
 
     // MARK: - Tool Definitions for OpenAI / AI Server Schema
 
@@ -78,7 +82,14 @@ public struct WebTools: ToolProvider {
             ]
         ])
         
-        let response = await Self.execute(name: name, argsJSON: argsJSON, cwd: cwd)
+        // Fail fast when the machine has no network path (e.g. Wi-Fi shut
+        // off) so the model gets an actionable message instead of a timeout.
+        let response: String
+        if !(await monitor.isOnline) {
+            response = "Error: No network connection available. \(name) cannot run until the network is restored. Do not retry this tool; tell the user the machine is offline and continue with local tools."
+        } else {
+            response = await Self.execute(name: name, argsJSON: argsJSON, cwd: cwd)
+        }
         
         sendJSON([
             "jsonrpc": "2.0",

@@ -21,6 +21,9 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private var tools: [ToolDefinition] = []
     private var openedWorkspacePath: String?
     private var started = false
+    // When true, every mcpbridge tool call (name, args, raw response) is
+    // appended to ~/.terrapinpilot/logs/mcp_bridge.log for inspection.
+    private let debugLog: Bool
     
     /// True once `start()` has spawned the mcpbridge process.
     public var isStarted: Bool { started }
@@ -75,7 +78,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
                 "update": [
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": callId,
-                    "status": result.starts(with: "Error") ? "failed" : "completed"
+                    "status": Self.isBridgeError(result) ? "failed" : "completed"
                 ]
             ]
         ])
@@ -116,8 +119,9 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         }
     }
 
-    public init(_ logger: Loggable) {
+    public init(_ logger: Loggable, debugLog: Bool = false) {
         self.logger = logger
+        self.debugLog = debugLog
     }
 
     /// Spawns `xcrun mcpbridge` using environment variables passed by Xcode ACP
@@ -219,6 +223,19 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     public func callTool(name: String, argsJSON: String, cwd: String)
         async -> String
     {
+        let result = await performToolCall(name: name, argsJSON: argsJSON, cwd: cwd)
+        if debugLog {
+            Self.appendBridgeDebugLog(name: name, argsJSON: argsJSON, result: result)
+        }
+        return result
+    }
+
+    /// The actual mcpbridge round-trip for a tool call, including the
+    /// tabIdentifier / workspaceIdentifier resolve-and-retry logic. Split out
+    /// from callTool so every response can be captured for the debug log.
+    private func performToolCall(name: String, argsJSON: String, cwd: String)
+        async -> String
+    {
         let argsData = argsJSON.data(using: .utf8) ?? Data()
         var argsDict =
             (try? JSONSerialization.jsonObject(with: argsData) as? [String: Any])
@@ -272,10 +289,12 @@ public actor XcodeMCPBridgeClient: ToolProvider {
 
         // 4. If the bridge rejects the injected workspace identifier (or none
         //    was available), resolve the correct one from XcodeListWorkspaces
-        //    and retry once.
+        //    and retry once. The bridge's message is lowercase ("unknown
+        //    workspace identifier"), so compare case-insensitively.
+        let loweredOutput = outputText.lowercased()
         if name != "XcodeListWorkspaces",
-            outputText.contains("Unknown workspace identifier")
-                || outputText.contains("workspaceIdentifier is required")
+            loweredOutput.contains("unknown workspace identifier")
+                || loweredOutput.contains("workspaceidentifier is required")
         {
             if let resolved = await resolveWorkspaceIdentifier(matchingCWD: cwd) {
                 activeWorkspaceIdentifier = resolved
@@ -326,6 +345,52 @@ public actor XcodeMCPBridgeClient: ToolProvider {
 
         let lines = content.compactMap { $0["text"] as? String }
         return lines.joined(separator: "\n")
+    }
+
+    /// Appends a record for a bridge tool call to ~/.terrapinpilot/logs/
+    /// mcp_bridge.log so the raw mcpbridge response for every Xcode MCP tool
+    /// operation can be inspected. Only called when debugLog is enabled.
+    private static func appendBridgeDebugLog(name: String, argsJSON: String, result: String) {
+        let directory = TerrapinPaths.logsDirectory
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let logURL = directory.appendingPathComponent("mcp_bridge.log")
+
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let flattenedArgs = argsJSON.replacingOccurrences(of: "\n", with: " ")
+        let flattenedResult = result.replacingOccurrences(of: "\n", with: " \\n ")
+        let record = """
+        [\(timestamp)] \(name)
+          args: \(flattenedArgs)
+          result: \(flattenedResult)
+
+        """
+
+        guard let data = record.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: logURL.path),
+           let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            try? handle.close()
+        } else {
+            try? data.write(to: logURL)
+        }
+    }
+
+    /// Returns true when a mcpbridge tool response represents an error.
+    ///
+    /// mcpbridge reports tool errors as a JSON object with a `"type":"error"`
+    /// field (e.g. `{"data":"Missing required parameter 'sourcePath'…",
+    /// "type":"error"}`), which does NOT start with `"Error"`. A naive
+    /// `starts(with: "Error")` check therefore misclassifies these as success.
+    /// This covers both the RPC-level error strings this client produces
+    /// (which do start with "Error") and the JSON error payloads.
+    static func isBridgeError(_ result: String) -> Bool {
+        if result.starts(with: "Error") { return true }
+        guard
+            let data = result.data(using: .utf8),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        return (json["type"] as? String) == "error"
     }
 
     /// Matches open window tabs directly against the pre-normalized `cwd`
@@ -380,8 +445,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private func parseWorkspaceIdentifier(from text: String) -> String? {
         if let data = text.data(using: .utf8),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-            let identifier = json["workspaceIdentifier"] as? String,
-            !identifier.isEmpty
+            let identifier = Self.cleanIdentifier(json["workspaceIdentifier"] as? String)
         {
             return identifier
         }
@@ -389,8 +453,18 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         guard let match = text.firstMatch(
             of: /"workspaceIdentifier"\s*:\s*"([^"]+)"/
         ) else { return nil }
-        let identifier = String(match.1)
-        return identifier.isEmpty ? nil : identifier
+        return Self.cleanIdentifier(String(match.1))
+    }
+
+    /// Strips the `*` marker Xcode uses to flag the active workspace or tab
+    /// in list output, plus surrounding whitespace. Returns nil when nothing
+    /// usable remains.
+    private static func cleanIdentifier(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let cleaned = raw
+            .replacingOccurrences(of: "*", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        return cleaned.isEmpty ? nil : cleaned
     }
 
     /// Lists open workspaces and returns the identifier whose `workspacePath`
@@ -404,21 +478,24 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         for line in result.components(separatedBy: .newlines)
         where line.contains("workspaceIdentifier:") && line.contains("workspacePath:")
         {
-            var identifier = ""
+            var identifier: String?
             var path = ""
             for part in line.components(separatedBy: ",") {
                 let trimmed = part.trimmingCharacters(in: .whitespaces)
                 if trimmed.contains("workspaceIdentifier:") {
-                    identifier = trimmed
-                        .replacingOccurrences(of: "workspaceIdentifier:", with: "")
-                        .trimmingCharacters(in: .whitespaces)
+                    // Xcode marks the active entry with a `*` (e.g.
+                    // "workspaceIdentifier: *  windowtab-XXX"); the marker is
+                    // not part of the identifier and the bridge rejects it.
+                    identifier = Self.cleanIdentifier(
+                        trimmed.replacingOccurrences(of: "workspaceIdentifier:", with: "")
+                    )
                 } else if trimmed.contains("workspacePath:") {
                     path = trimmed
                         .replacingOccurrences(of: "workspacePath:", with: "")
                         .trimmingCharacters(in: .whitespaces)
                 }
             }
-            guard !identifier.isEmpty, !path.isEmpty else { continue }
+            guard let identifier, !path.isEmpty else { continue }
             if path == cwd || cwd.hasPrefix(path) || path.hasPrefix(cwd) {
                 if identifier.hasPrefix("workspace-") {
                     return identifier
@@ -482,7 +559,7 @@ public actor XcodeMCPBridgeClient: ToolProvider {
         case "RunSomeTests", "RunAllTests":
             return ("execute", name)
         case "RunCodeSnippet":
-            return ("execute", "Running Code Snippet")
+            return ("execute", name)
         case "DocumentationSearch":
             return ("other", "Searching Apple Documentation")
         case "GetBuildLog", "XcodeListNavigatorIssues":

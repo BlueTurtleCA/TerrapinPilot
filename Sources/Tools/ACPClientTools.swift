@@ -286,12 +286,12 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                     "properties": AnySendable([
                         "command": AnySendable([
                             "type": AnySendable("string"),
-                            "description": AnySendable("The command to execute, e.g. 'git'.")
+                            "description": AnySendable("The program to execute, e.g. 'git' — not a full command line; put arguments in `args`. For shell pipelines, redirects, command substitution, or multiple statements, put the entire line here (e.g. 'git status | grep modified') and leave `args` empty; it is then run via /bin/sh -c.")
                         ]),
                         "args": AnySendable([
                             "type": AnySendable("array"),
                             "items": AnySendable(["type": AnySendable("string")]),
-                            "description": AnySendable("Command arguments as separate strings, e.g. [\"status\", \"-s\"].")
+                            "description": AnySendable("Command arguments as separate strings, e.g. [\"status\", \"-s\"]. No shell metacharacters — for those, use a full line in `command`.")
                         ]),
                         "cwd": AnySendable([
                             "type": AnySendable("string"),
@@ -419,22 +419,16 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         let path = Self.resolveWorkspacePath(relativePath: rawPath, workspaceRoot: cwd)
         let fileName = URL(fileURLWithPath: path).lastPathComponent
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "read_file",
-                    "title": "Reading \(fileName)",
-                    "kind": "read",
-                    "status": "in_progress",
-                    "locations": [["path": path]]
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "read_file",
+            title: "Reading \(fileName)",
+            status: "in_progress",
+            kind: "read",
+            locations: [["path": path]],
+            sendJSON: sendJSON
+        )
         
         var params: [String: Any] = [
             "sessionId": sessionId,
@@ -447,6 +441,30 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             params["limit"] = limit
         }
         
+        // Prefer the Xcode bridge so reads see unsaved editor changes and
+        // stay in sync with the IDE; fall back to the ACP client read when
+        // the bridge is unavailable or the file is outside the project.
+        if let bridge = xcodeBridge, await bridge.isStarted {
+            var bridgeArgs: [String: Any] = [
+                "filePath": Self.workspaceRelativePath(path, workspaceRoot: cwd)
+            ]
+            if let line = args["line"] as? Int {
+                bridgeArgs["offset"] = line
+            }
+            if let limit = args["limit"] as? Int {
+                bridgeArgs["limit"] = limit
+            }
+            let bridgeResult = await bridge.callTool(
+                name: "XcodeRead",
+                argsJSON: Self.makeArgsJSON(bridgeArgs),
+                cwd: cwd
+            )
+            if let content = Self.parseXcodeReadContent(bridgeResult) {
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+                return content
+            }
+        }
+        
         do {
             switch await clientChannel.request(method: "fs/read_text_file", params: params) {
             case .result(let result):
@@ -454,18 +472,7 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                     throw ACPError.message("Error reading text file: No content from \(path)")
                 }
                 
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "completed"
-                        ]
-                    ]
-                ])
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
                 
                 return response
                 
@@ -495,37 +502,40 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         
         let oldText = try? await internalReadTextFile(clientChannel: self.clientChannel, sessionId: sessionId, path: path)
         
-        var update: [String: Any] = [
-            "sessionUpdate": "tool_call",
-            "toolCallId": callId,
-            "name": "write_file",
-            "title": "Writing \(fileName)",
-            "kind": "edit",
-            "status": "in_progress",
-            "locations": [
-                ["path": path]
-            ]
-        ];
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "write_file",
+            title: "Writing \(fileName)",
+            status: "in_progress",
+            kind: "edit",
+            locations: [["path": path]],
+            content: oldText.map { Self.diffContent(path: path, oldText: $0, newText: content) },
+            sendJSON: sendJSON
+        )
         
-        if oldText != nil {
-            update["content"] = [
-                [
-                    "type": "diff",
-                    "path": path,
-                    "oldText": oldText,
-                    "newText": content
-                ]
-            ];
+        // Prefer the Xcode bridge so the IDE stays in sync (open editors,
+        // project references for new files); fall back to the ACP client
+        // write when it fails (e.g. the file is outside the project).
+        if let bridge = xcodeBridge, await bridge.isStarted {
+            let relPath = Self.workspaceRelativePath(path, workspaceRoot: cwd)
+            let bridgeResult = await bridge.callTool(
+                name: "XcodeWrite",
+                argsJSON: Self.makeArgsJSON(["filePath": relPath, "content": content]),
+                cwd: cwd
+            )
+            if !XcodeMCPBridgeClient.isBridgeError(bridgeResult) {
+                Self.sendToolCallUpdate(
+                    sessionId: sessionId,
+                    callId: callId,
+                    status: "completed",
+                    locations: [["path": path]],
+                    content: Self.diffContent(path: path, oldText: oldText, newText: content),
+                    sendJSON: sendJSON
+                )
+                return "File written successfully: \(path)"
+            }
         }
-        
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": update
-            ]
-        ])
         
         // The ACP client creates the file itself but not its parent
         // directories (the spec only requires the file), and ACP has no
@@ -539,18 +549,7 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                     withIntermediateDirectories: true
                 )
             } catch {
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "failed"
-                        ]
-                    ]
-                ])
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
                 return "Error creating parent directory for '\(path)': \(error.localizedDescription)"
             }
         }
@@ -560,44 +559,18 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             params: ["sessionId": sessionId, "path": path, "content": content]
         ) {
         case .result:
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "completed"
-                    ],
-                    "locations": [
-                        ["path": path]
-                    ],
-                    "content": [
-                        [
-                            "type": "diff",
-                            "path": path,
-                            "oldText": oldText,
-                            "newText": content
-                        ]
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(
+                sessionId: sessionId,
+                callId: callId,
+                status: "completed",
+                locations: [["path": path]],
+                content: Self.diffContent(path: path, oldText: oldText, newText: content),
+                sendJSON: sendJSON
+            )
             
             return "File written successfully: \(path)"
         case .error(let message):
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "failed"
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
             return "Error writing '\(path)': \(message)"
         }
     }
@@ -638,76 +611,35 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
 
         let updatedText = currentText.replacingOccurrences(of: existingText, with: newText)
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "write_file",
-                    "title": "Writing \(fileName)",
-                    "kind": "edit",
-                    "status": "in_progress",
-                    "locations": [
-                        ["path": path]
-                    ],
-                    "content": [
-                        [
-                            "type": "diff",
-                            "path": path,
-                            "oldText": currentText,
-                            "newText": updatedText
-                        ]
-                    ]
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "write_file",
+            title: "Writing \(fileName)",
+            status: "in_progress",
+            kind: "edit",
+            locations: [["path": path]],
+            content: Self.diffContent(path: path, oldText: currentText, newText: updatedText),
+            sendJSON: sendJSON
+        )
         
         switch await clientChannel.request(
             method: "fs/write_text_file",
             params: ["sessionId": sessionId, "path": path, "content": updatedText]
         ) {
         case .result:
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "completed"
-                    ],
-                    "locations": [
-                        ["path": path]
-                    ],
-                    "content": [
-                        [
-                            "type": "diff",
-                            "path": path,
-                            "oldText": currentText,
-                            "newText": updatedText
-                        ]
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(
+                sessionId: sessionId,
+                callId: callId,
+                status: "completed",
+                locations: [["path": path]],
+                content: Self.diffContent(path: path, oldText: currentText, newText: updatedText),
+                sendJSON: sendJSON
+            )
             
             return "File edited successfully: \(path)"
         case .error(let message):
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "failed"
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
             return "Error writing '\(path)': \(message)"
         }
     }
@@ -738,36 +670,23 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         
         let resultText = matches.isEmpty ? "No matches found for '\(query)'." : matches.joined(separator: "\n")
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "grep_file",
-                    "title": commandString,
-                    "kind": "execute",
-                    "status": "in_progress"
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "grep_file",
+            title: commandString,
+            status: "in_progress",
+            sendJSON: sendJSON
+        )
         
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": callId,
-                    "title": commandString,
-                    "status": "completed"
-                ]
-            ]
-        ])
+        Self.sendToolCallUpdate(
+            sessionId: sessionId,
+            callId: callId,
+            status: "completed",
+            title: commandString,
+            sendJSON: sendJSON
+        )
             
         return resultText
     }
@@ -801,25 +720,19 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             return "Error: Destination already exists: \(newPath)"
         }
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "move_file",
-                    "title": "Moving \(fileName) to \(newFileName)",
-                    "kind": "edit",
-                    "status": "in_progress",
-                    "locations": [
-                        ["path": path],
-                        ["path": newPath]
-                    ]
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "move_file",
+            title: "Moving \(fileName) to \(newFileName)",
+            status: "in_progress",
+            kind: "edit",
+            locations: [
+                ["path": path],
+                ["path": newPath]
+            ],
+            sendJSON: sendJSON
+        )
         
         // The destination's parent directory may not exist yet (a move into
         // a new subdirectory). Neither the Xcode bridge nor the ACP write
@@ -832,18 +745,7 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                     withIntermediateDirectories: true
                 )
             } catch {
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "failed"
-                        ]
-                    ]
-                ])
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
                 return "Error creating parent directory for '\(newPath)': \(error.localizedDescription)"
             }
         }
@@ -855,22 +757,11 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             let to = Self.workspaceRelativePath(newPath, workspaceRoot: cwd)
             let bridgeResult = await bridge.callTool(
                 name: "XcodeMV",
-                argsJSON: Self.makeArgsJSON(["from": from, "to": to]),
+                argsJSON: Self.makeArgsJSON(["sourcePath": from, "destinationPath": to]),
                 cwd: cwd
             )
-            if !bridgeResult.starts(with: "Error") {
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "completed"
-                        ]
-                    ]
-                ])
+            if !XcodeMCPBridgeClient.isBridgeError(bridgeResult) {
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
                 return "File moved successfully: \(path) -> \(newPath)"
             }
         }
@@ -886,18 +777,7 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             do {
                 try FileManager.default.moveItem(atPath: path, toPath: newPath)
             } catch {
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "failed"
-                        ]
-                    ]
-                ])
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
                 return "Error renaming '\(path)' to '\(newPath)': \(error.localizedDescription)"
             }
         }
@@ -905,33 +785,11 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         do {
             try FileManager.default.removeItem(atPath: path)
         } catch {
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "failed"
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
             return "Error: Created '\(newPath)' but failed to delete the original '\(path)': \(error.localizedDescription)"
         }
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": callId,
-                    "status": "completed"
-                ]
-            ]
-        ])
+        Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
         
         return "File moved successfully: \(path) -> \(newPath)"
     }
@@ -955,24 +813,16 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             return "Error: File does not exist: \(path)"
         }
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "delete_file",
-                    "title": "Deleting \(fileName)",
-                    "kind": "edit",
-                    "status": "in_progress",
-                    "locations": [
-                        ["path": path]
-                    ]
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "delete_file",
+            title: "Deleting \(fileName)",
+            status: "in_progress",
+            kind: "edit",
+            locations: [["path": path]],
+            sendJSON: sendJSON
+        )
         
         // Prefer the Xcode bridge so the IDE stays in sync (navigator, open
         // editors, project references); fall back to local operations.
@@ -983,19 +833,8 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                 argsJSON: Self.makeArgsJSON(["path": relPath]),
                 cwd: cwd
             )
-            if !bridgeResult.starts(with: "Error") {
-                sendJSON([
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": [
-                        "sessionId": sessionId,
-                        "update": [
-                            "sessionUpdate": "tool_call_update",
-                            "toolCallId": callId,
-                            "status": "completed"
-                        ]
-                    ]
-                ])
+            if !XcodeMCPBridgeClient.isBridgeError(bridgeResult) {
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
                 return "File deleted successfully: \(path)"
             }
         }
@@ -1003,33 +842,11 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         do {
             try FileManager.default.removeItem(atPath: path)
         } catch {
-            sendJSON([
-                "jsonrpc": "2.0",
-                "method": "session/update",
-                "params": [
-                    "sessionId": sessionId,
-                    "update": [
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": callId,
-                        "status": "failed"
-                    ]
-                ]
-            ])
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
             return "Error deleting '\(path)': \(error.localizedDescription)"
         }
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": callId,
-                    "status": "completed"
-                ]
-            ]
-        ])
+        Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
         
         return "File deleted successfully: \(path)"
     }
@@ -1042,24 +859,16 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         let path = rawPath.isEmpty ? cwd : Self.resolveWorkspacePath(relativePath: rawPath, workspaceRoot: cwd)
         let dirName = URL(fileURLWithPath: path).lastPathComponent
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": callId,
-                    "name": "list_directory",
-                    "title": "Listing \(dirName)",
-                    "kind": "read",
-                    "status": "in_progress",
-                    "locations": [
-                        ["path": path]
-                    ]
-                ]
-            ]
-        ])
+        Self.sendToolCall(
+            sessionId: sessionId,
+            callId: callId,
+            name: "list_directory",
+            title: "Listing \(dirName)",
+            status: "in_progress",
+            kind: "read",
+            locations: [["path": path]],
+            sendJSON: sendJSON
+        )
         
         var result: String
         if let bridge = xcodeBridge, await bridge.isStarted {
@@ -1069,23 +878,17 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                 argsJSON: Self.makeArgsJSON(["path": relPath]),
                 cwd: cwd
             )
-            result = bridgeResult.starts(with: "Error") ? runListDirectory(path) : bridgeResult
+            result = XcodeMCPBridgeClient.isBridgeError(bridgeResult) ? runListDirectory(path) : bridgeResult
         } else {
             result = runListDirectory(path)
         }
         
-        sendJSON([
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": [
-                "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": callId,
-                    "status": result.starts(with: "Error") ? "failed" : "completed"
-                ]
-            ]
-        ])
+        Self.sendToolCallUpdate(
+            sessionId: sessionId,
+            callId: callId,
+            status: XcodeMCPBridgeClient.isBridgeError(result) ? "failed" : "completed",
+            sendJSON: sendJSON
+        )
         
         return result
     }
@@ -1101,19 +904,35 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         guard let command = args["command"] as? String, !command.isEmpty else {
             return .failure("Error: Missing 'command' parameter")
         }
+        let commandArgs = (args["args"] as? [String]) ?? []
+
+        // A bare program name (the intended `command` value) has no spaces and
+        // no shell metacharacters. If the agent instead put a full shell
+        // command line in `command` (pipes, redirects, command substitution,
+        // multiple statements, ...), re-express it as `/bin/sh -c "<line>"` so
+        // the shell interprets it. Without this, the client tries to exec the
+        // whole string as a single program name and fails with
+        // "env: <line>: No such file or directory".
+        var finalCommand = command
+        var finalArgs: [String] = commandArgs
+        if Self.looksLikeShellCommandLine(command) {
+            var line = command
+            if !commandArgs.isEmpty {
+                line += " " + commandArgs.joined(separator: " ")
+            }
+            finalCommand = "/bin/sh"
+            finalArgs = ["-c", line]
+        }
 
         var params: [String: Any] = [
             "sessionId": sessionId,
-            "command": command,
+            "command": finalCommand,
             "outputByteLimit": 1_048_576,
-            "args": [String](),
+            "args": finalArgs,
             "env": [[String: String]]()
         ]
         if !cwd.isEmpty {
             params["cwd"] = cwd
-        }
-        if let commandArgs = args["args"] as? [String], !commandArgs.isEmpty {
-            params["args"] = commandArgs
         }
         if let rawCwd = args["cwd"] as? String, !rawCwd.isEmpty {
             params["cwd"] = Self.resolveWorkspacePath(relativePath: rawCwd, workspaceRoot: cwd)
@@ -1474,9 +1293,27 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         return root.lastPathComponent + "/" + relative
     }
     
-    private static func makeArgsJSON(_ args: [String: String]) -> String {
+    private static func makeArgsJSON(_ args: [String: Any]) -> String {
         (try? JSONSerialization.data(withJSONObject: args))
             .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+    
+    /// XcodeRead answers with a JSON object whose `content` field holds the
+    /// file in cat -n format (right-aligned line number, tab, text). Extracts
+    /// that field and strips the line-number prefixes so the result matches
+    /// the plain content the ACP read returns. Returns nil when the bridge
+    /// result is not a successful XcodeRead response (error text, prose, ...),
+    /// in which case the caller falls back to the ACP client read.
+    private static func parseXcodeReadContent(_ result: String) -> String? {
+        guard let data = result.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let catN = json["content"] as? String
+        else { return nil }
+        return catN.replacingOccurrences(
+            of: "^[ \\t]*\\d+\\t",
+            with: "",
+            options: .regularExpression
+        )
     }
     
     private static func terminalId(from argsJSON: String) -> String? {
@@ -1506,6 +1343,20 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         return command
     }
     
+    /// True when a `command` value is a full shell command line rather than a
+    /// bare program name. A program name has no spaces and no shell
+    /// metacharacters; the presence of either means the value needs /bin/sh to
+    /// interpret it (pipes, redirects, command substitution, globs, multiple
+    /// statements, ...). Used to transparently re-express such values as
+    /// `/bin/sh -c "<line>"` so the client's direct exec doesn't fail.
+    private static func looksLikeShellCommandLine(_ command: String) -> Bool {
+        let shellChars: Set<Character> = [
+            " ", "\t", "\n", "|", ";", "&", ">", "<", "$", "`",
+            "*", "?", "(", ")", "{", "}", "[", "]", "~", "!", "#"
+        ]
+        return command.contains(where: { shellChars.contains($0) })
+    }
+    
     /// Emits a tool_call session/update. When terminalId is provided the
     /// terminal is embedded in the tool call so the client displays its
     /// live output (ACP spec: Terminals > Embedding in Tool Calls).
@@ -1515,6 +1366,9 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         name: String,
         title: String,
         status: String,
+        kind: String = "execute",
+        locations: [[String: Any]]? = nil,
+        content: [[String: Any]]? = nil,
         terminalId: String? = nil,
         sendJSON: ([String: Any]) -> Void
     ) {
@@ -1523,9 +1377,15 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             "toolCallId": callId,
             "name": name,
             "title": title,
-            "kind": "execute",
+            "kind": kind,
             "status": status,
         ]
+        if let locations {
+            update["locations"] = locations
+        }
+        if let content {
+            update["content"] = content
+        }
         if let terminalId {
             update["content"] = [
                 ["type": "terminal", "terminalId": terminalId]
@@ -1545,20 +1405,47 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         sessionId: String,
         callId: String,
         status: String,
+        title: String? = nil,
+        locations: [[String: Any]]? = nil,
+        content: [[String: Any]]? = nil,
         sendJSON: ([String: Any]) -> Void
     ) {
+        var update: [String: Any] = [
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": callId,
+            "status": status,
+        ]
+        if let title {
+            update["title"] = title
+        }
+        if let locations {
+            update["locations"] = locations
+        }
+        if let content {
+            update["content"] = content
+        }
         sendJSON([
             "jsonrpc": "2.0",
             "method": "session/update",
             "params": [
                 "sessionId": sessionId,
-                "update": [
-                    "sessionUpdate": "tool_call_update",
-                    "toolCallId": callId,
-                    "status": status,
-                ]
+                "update": update,
             ]
         ])
+    }
+    
+    /// The diff content block for a tool call/update: the client renders it
+    /// as the before/after of the file change. A nil oldText (new file) is
+    /// serialized as null, matching the ACP diff shape.
+    private static func diffContent(path: String, oldText: String?, newText: String) -> [[String: Any]] {
+        [
+            [
+                "type": "diff",
+                "path": path,
+                "oldText": oldText ?? NSNull(),
+                "newText": newText
+            ]
+        ]
     }
     
     private func runStandardGrep(

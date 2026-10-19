@@ -27,7 +27,7 @@ let package = Package(
         ),
         .target(
             name: "Tools",
-            dependencies: ["Logger", "Stores"]
+            dependencies: ["Logger", "Stores", "Helpers"]
         ),
         .target(
             name: "Agent",
@@ -38,8 +38,13 @@ let package = Package(
             dependencies: ["Logger", "Stores", "Tools", "Enums", "Helpers", "Agent"],
             resources: [
                 .process("Resources/system_prompt_xcode.txt"),
-                .process("Resources/system_prompt_generic.txt")
+                .process("Resources/system_prompt_generic.txt"),
+                .process("Resources/skills")
             ]
         ),
+        .testTarget(
+            name: "HelpersTests",
+            dependencies: ["Helpers"]
+        )
     ]
 )

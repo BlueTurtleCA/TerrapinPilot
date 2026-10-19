@@ -23,6 +23,8 @@ struct Config: Sendable {
     /// Client assumed when the connecting ACP client does not identify
     /// itself via `clientInfo` in the `initialize` request.
     let defaultClient: ClientKind
+    /// Additional skill directories from `--skills-dir` / `AI_SKILLS_DIR`.
+    let skillDirectories: [String]
 
     /// The OpenAI-compatible chat completions endpoint derived from the server base URL.
     var chatCompletionsURL: URL {
@@ -66,6 +68,7 @@ struct Config: Sendable {
                     : ClientKind.xcode
             }
             ?? .xcode
+        let skillDirectories = Self.skillDirectories(args: args, env: env)
 
         guard let serverURL = URL(string: serverURLString) else {
             fatalError("Invalid AI server URL: \(serverURLString)")
@@ -77,7 +80,8 @@ struct Config: Sendable {
             contextWindowOverride: contextWindowOverride,
             slots: slots,
             debugLog: debugLog,
-            defaultClient: defaultClient
+            defaultClient: defaultClient,
+            skillDirectories: skillDirectories
         )
     }
 
@@ -86,5 +90,30 @@ struct Config: Sendable {
             let index = args.firstIndex(of: flag), index + 1 < args.count
         else { return nil }
         return args[index + 1]
+    }
+
+    /// Collects extra skill directories: repeatable `--skills-dir` flags plus
+    /// the colon-separated `AI_SKILLS_DIR` environment variable.
+    private static func skillDirectories(args: [String], env: [String: String]) -> [String] {
+        var directories = argValues("--skills-dir", in: args)
+        if let envValue = env["AI_SKILLS_DIR"] {
+            directories.append(contentsOf: envValue.split(separator: ":").map(String.init))
+        }
+        var seen = Set<String>()
+        return directories.filter { seen.insert($0).inserted }
+    }
+
+    /// Returns every value of a repeatable `--flag value` CLI argument.
+    private static func argValues(_ flag: String, in args: [String]) -> [String] {
+        var values: [String] = []
+        var index = 0
+        while index < args.count {
+            if args[index] == flag, index + 1 < args.count {
+                values.append(args[index + 1])
+                index += 1
+            }
+            index += 1
+        }
+        return values
     }
 }

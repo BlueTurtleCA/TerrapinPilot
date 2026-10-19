@@ -11,6 +11,10 @@ import Logger
 public actor SessionStore {
     private var workingDirs: [String: String] = [:]
     private var histories: [String: [ChatMessage]] = [:]
+    // Last observed network state per session, used to inject a note into
+    // the conversation when the machine goes offline or the connection is
+    // restored.
+    private var networkStates: [String: Bool] = [:]
     private let sessionsDirectory: URL
     private let logger: Loggable
     
@@ -70,6 +74,18 @@ public actor SessionStore {
         return workingDirs[sessionId]
     }
     
+    // Last observed network state for a session (nil when never observed).
+    public func networkState(for sessionId: String) -> Bool? {
+        return networkStates[sessionId]
+    }
+    
+    // Records the session's network state so the next turn can detect a
+    // transition and notify the model.
+    public func setNetworkState(_ online: Bool, for sessionId: String) {
+        networkStates[sessionId] = online
+        persist(sessionId)
+    }
+    
     // Get chat history or fallback to standard system prompt
     public func getHistory(for sessionId: String, defaultSystemPrompt: String) -> [ChatMessage] {
         return histories[sessionId] ?? [
@@ -99,6 +115,9 @@ public actor SessionStore {
         }
         if let cwd = record.cwd {
             workingDirs[sessionId] = cwd
+        }
+        if let state = record.networkState {
+            networkStates[sessionId] = state
         }
         histories[sessionId] = record.history
         return true
@@ -139,6 +158,7 @@ public actor SessionStore {
     public func deleteSession(for sessionId: String) {
         workingDirs[sessionId] = nil
         histories[sessionId] = nil
+        networkStates[sessionId] = nil
         do {
             try FileManager.default.removeItem(at: fileURL(for: sessionId))
         } catch let error as NSError where
@@ -157,6 +177,7 @@ public actor SessionStore {
     private struct SessionRecord: Codable {
         var cwd: String?
         var history: [ChatMessage]
+        var networkState: Bool?
     }
 
     /// File for a session. Session IDs are normally UUIDs, but clients may
@@ -174,7 +195,8 @@ public actor SessionStore {
     private func persist(_ sessionId: String) {
         let record = SessionRecord(
             cwd: workingDirs[sessionId],
-            history: histories[sessionId] ?? []
+            history: histories[sessionId] ?? [],
+            networkState: networkStates[sessionId]
         )
         do {
             try FileManager.default.createDirectory(

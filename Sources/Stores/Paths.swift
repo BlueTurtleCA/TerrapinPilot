@@ -15,7 +15,7 @@ public enum TerrapinPaths {
     /// User-level root: `~/.terrapinpilot`.
     public static var userDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("terrapinpilot", isDirectory: true)
+            .appendingPathComponent(".terrapinpilot", isDirectory: true)
     }
 
     /// Persisted session state: `~/.terrapinpilot/sessions`.
@@ -29,7 +29,7 @@ public enum TerrapinPaths {
     }
 
     /// Workspace-level scratch directory name (web fetch cache, ...).
-    public static let workspaceDirectoryName = "terrapinpilot"
+    public static let workspaceDirectoryName = ".terrapinpilot"
 
     /// Workspace-level web fetch cache: `./.terrapinpilot/web` under `cwd`.
     public static func webCacheDirectory(in cwd: String) -> String {

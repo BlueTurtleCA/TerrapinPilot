@@ -11,7 +11,7 @@ import Stores
 public struct ContextManager {
 
     /// Estimates token count for a message list (approx. 1 token = 3.5 characters)
-    private static func estimateTokenCount(_ history: [ChatMessage]) -> Int {
+    static func estimateTokenCount(_ history: [ChatMessage]) -> Int {
         var totalChars = 0
         for msg in history {
             totalChars += msg.content?.count ?? 0
@@ -91,13 +91,24 @@ public struct ContextManager {
     public static func resolveContextWindow(
         _ endpoint: String
     ) async -> Int {
+        await resolveContextWindow(endpoint) { url in
+            let (data, _) = try await URLSession.shared.data(from: url)
+            return data
+        }
+    }
+
+    /// Testable variant of ``resolveContextWindow(_:)`` with an injectable fetcher.
+    static func resolveContextWindow(
+        _ endpoint: String,
+        fetch: @Sendable (URL) async throws -> Data
+    ) async -> Int {
         let candidateURLs = [
             "\(endpoint)/api/v1/models",
             "\(endpoint)/v1/models",
         ].compactMap { URL(string: $0) }
 
         for url in candidateURLs {
-            guard let (data, _) = try? await URLSession.shared.data(from: url),
+            guard let data = try? await fetch(url),
                 let json = try? JSONSerialization.jsonObject(with: data)
                     as? [String: Any],
                 let models = json["data"] as? [[String: Any]],

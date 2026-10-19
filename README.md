@@ -22,6 +22,7 @@ Xcode  ⇄  (ACP / JSON-RPC)  ⇄  TerrapinPilot  ⇄  (OpenAI-compatible HTTP) 
 - **Reuse the server's KV cache** by pinning each session to a stable slot (llama.cpp), so follow-up turns only process the delta.
 - **Resume previous sessions** — session state (working directory + chat history) is persisted to `~/.terrapinpilot/sessions/`, so `session/load` restores a conversation after a restart. Sessions not updated for 30 days are removed automatically on startup.
 - **Pick up project instructions** from an `AGENTS.md` file in the working directory.
+- **Load skills** — reusable instruction packs (`SKILL.md` files) discovered from the project, user, and bundled directories, and loaded on demand via the `use_skill` tool.
 
 ## How it works
 
@@ -66,6 +67,7 @@ TerrapinPilot is configured with CLI arguments, which take precedence over envir
 | `--slots` | `AI_SLOTS` | `1` | Number of server-side context slots (llama.cpp `-np` / `n_parallel`). Sessions are pinned to a slot so the KV cache is reused across turns. |
 | `--debug-log` | `AI_DEBUG_LOG` | `false` | Write each request body to `~/.terrapinpilot/logs/NNNN.json` for prefix-stability debugging. |
 | `--default-client` | `AI_DEFAULT_CLIENT` | `xcode` | Client assumed when the connecting ACP client does not identify itself (`xcode` or `generic`). |
+| `--skills-dir` | `AI_SKILLS_DIR` | none | Additional skill directories. The flag is repeatable; the environment variable is colon-separated. |
 
 One additional, optional variable:
 
@@ -111,6 +113,43 @@ On `initialize`, TerrapinPilot reads the client's `clientInfo` (name/title) to i
 - **Xcode MCP tools** — discovered at runtime from `xcrun mcpbridge` (read, edit, build, test, debug, previews, and more). TerrapinPilot auto-injects the `workspaceIdentifier` and `tabIdentifier` so the model does not have to supply them.
 - **`web_fetch`** — fetches an HTTP/HTTPS URL and returns its text content.
 - **`web_search`** — searches the live web (Tavily or DuckDuckGo).
+- **`use_skill`** — loads the full instructions of a skill from the `AVAILABLE SKILLS` catalog in the system prompt.
+
+## Skills
+
+TerrapinPilot supports **skills**: reusable instruction packs stored as markdown files. A skill is a directory containing a `SKILL.md` file with YAML frontmatter:
+
+```markdown
+---
+name: git-release-notes
+description: Generate release notes from git history. Use when the user asks for changelogs or release notes.
+---
+# Git Release Notes
+1. Run `git log --oneline <last-tag>..HEAD` ...
+2. Group commits by type ...
+```
+
+Skills are discovered from these locations (highest precedence first; the first definition of a name wins):
+
+| Location | Scope |
+| --- | --- |
+| `<workspace>/.terrapinpilot/skills/<name>/` | Project — commit to the repo to share with the team |
+| `~/.terrapinpilot/skills/<name>/` | User — personal, applies to all projects |
+| `--skills-dir` / `AI_SKILLS_DIR` (colon-separated) | Extra directories |
+| Bundled `Resources/skills/<name>.md` | Shipped with the binary |
+
+Only each skill's name and description are injected into the system prompt (the `AVAILABLE SKILLS` section). When a request matches a skill's description, the model calls `use_skill` to load the full instructions. A skill may reference sibling files in its directory (scripts, templates, reference docs), which the model can open with `read_file`.
+
+Bundled skills use a flat layout — one uniquely named `.md` file per skill (e.g. `Resources/skills/git-commit.md`) — because the Swift build system flattens package resource directories into the bundle root, so two `SKILL.md` files in nested directories would collide. The frontmatter `name` still wins; the file's base name is the fallback.
+
+To create a custom skill:
+
+```sh
+mkdir -p ~/.terrapinpilot/skills/git-release-notes
+# then write ~/.terrapinpilot/skills/git-release-notes/SKILL.md
+```
+
+New skills are picked up when a new session starts.
 
 ## Testing TerrapinPilot
 
@@ -158,11 +197,13 @@ TerrapinPilot/
     │   ├── Config.swift                 # CLI args + env var configuration
     │   └── Resources/
     │       ├── system_prompt_xcode.txt  # Xcode-specific system prompt template
-    │       └── system_prompt_generic.txt# Generic (non-Xcode) system prompt template
+    │       ├── system_prompt_generic.txt# Generic (non-Xcode) system prompt template
+    │       └── skills/                  # Bundled skills (one <name>.md per skill)
     ├── Enums/
     │   └── MCPError.swift
     ├── Helpers/
-    │   └── ContextManager.swift         # Context-window detection + history compaction
+    │   ├── ContextManager.swift         # Context-window detection + history compaction
+    │   └── SkillCatalog.swift           # Skill discovery + SKILL.md frontmatter parsing
     ├── Logger/
     │   ├── Loggable.swift               # Logging protocol
     │   ├── OSLogger.swift               # os.Logger implementation
@@ -175,6 +216,7 @@ TerrapinPilot/
     └── Tools/
         ├── ToolProvider.swift           # Tool provider protocol + registry
         ├── WebTools.swift               # web_fetch + web_search
+        ├── SkillTools.swift             # use_skill
         └── XcodeMCPBridgeClient.swift   # xcrun mcpbridge MCP client
 ```
 

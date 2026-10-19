@@ -19,8 +19,10 @@ public struct Agent: Sendable {
     private let sessionStore: SessionStore
     private let contextWindow: Int
     private let systemPromptTemplates: [ClientKind: String]
+    private let skillCatalog: @Sendable (String) -> SkillCatalog
     private let logger: Loggable
     private let slotCount: Int
+    private let networkMonitor: NetworkMonitor
 
     public init(
         llmClient: LLMClient,
@@ -28,16 +30,20 @@ public struct Agent: Sendable {
         sessionStore: SessionStore,
         contextWindow: Int,
         systemPromptTemplates: [ClientKind: String],
+        skillCatalog: @escaping @Sendable (String) -> SkillCatalog = { _ in SkillCatalog(skills: []) },
         logger: Loggable,
-        slotCount: Int = 1
+        slotCount: Int = 1,
+        networkMonitor: NetworkMonitor = .shared
     ) {
         self.llmClient = llmClient
         self.toolRegistry = toolRegistry
         self.sessionStore = sessionStore
         self.contextWindow = contextWindow
         self.systemPromptTemplates = systemPromptTemplates
+        self.skillCatalog = skillCatalog
         self.logger = logger
         self.slotCount = slotCount
+        self.networkMonitor = networkMonitor
     }
 
     /// Runs a full agent turn for `prompt` within `sessionId`.
@@ -64,14 +70,31 @@ public struct Agent: Sendable {
             return
         }
 
+        // Check connectivity before building the prompt so a session that
+        // starts offline gets the warning in its system prompt.
+        let online = await networkMonitor.isOnline
+
         var history = await sessionStore.getHistory(
             for: sessionId,
             defaultSystemPrompt: buildSystemPrompt(
                 cwd: cwd,
                 client: client,
-                terminalToolsAvailable: tools.contains { $0.function.name == "run_command" }
+                terminalToolsAvailable: tools.contains { $0.function.name == "run_command" },
+                online: online
             )
         )
+
+        // Notify the model when the network state changed since the last
+        // turn: web tools are useless while offline, and the model should
+        // know when the connection comes back.
+        let previousNetworkState = await sessionStore.networkState(for: sessionId)
+        if let note = NetworkMonitor.transitionNote(online: online, previous: previousNetworkState) {
+            history.append(ChatMessage(role: "user", content: note))
+        }
+        if previousNetworkState != online {
+            await sessionStore.setNetworkState(online, for: sessionId)
+        }
+
         history.append(ChatMessage(role: "user", content: prompt))
 
         // Pin this session to a stable server slot so the backend (llama.cpp)
@@ -293,7 +316,7 @@ public struct Agent: Sendable {
 
     // MARK: - Prompt Building
 
-    private func buildSystemPrompt(cwd: String, client: ClientKind, terminalToolsAvailable: Bool) -> String {
+    private func buildSystemPrompt(cwd: String, client: ClientKind, terminalToolsAvailable: Bool, online: Bool) -> String {
         var customInstructionsBlock = ""
 
         if let agentInstructions = loadWorkspaceInstructions(from: cwd) {
@@ -313,6 +336,19 @@ public struct Agent: Sendable {
 
             """ : ""
 
+        // Web tools are useless on an offline machine; say so in the base
+        // prompt for sessions that start while the network is down.
+        let networkStatusBlock = online ? "" : """
+            ### NETWORK STATUS
+            The machine is currently offline. web_search and web_fetch will fail until the connection is restored. Do not attempt web tools; rely on local files and your existing knowledge, and let the user know the network is down.
+
+            """
+
+        // Skills use progressive disclosure: only the catalog (name +
+        // description) goes into the prompt; the model loads the full
+        // instructions on demand via the use_skill tool.
+        let skillsBlock = skillCatalog(cwd).promptBlock()
+
         let template =
             systemPromptTemplates[client]
             ?? systemPromptTemplates[.generic(name: "unknown")]
@@ -321,6 +357,8 @@ public struct Agent: Sendable {
         return template
             .replacingOccurrences(of: "{{CWD}}", with: cwd)
             .replacingOccurrences(of: "{{TERMINAL_TOOLS}}", with: terminalToolsBlock)
+            .replacingOccurrences(of: "{{NETWORK_STATUS}}", with: networkStatusBlock)
+            .replacingOccurrences(of: "{{SKILLS}}", with: skillsBlock)
             .replacingOccurrences(of: "{{CUSTOM_INSTRUCTIONS}}", with: customInstructionsBlock)
     }
 
