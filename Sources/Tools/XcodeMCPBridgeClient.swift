@@ -21,6 +21,10 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     private var tools: [ToolDefinition] = []
     private var openedWorkspacePath: String?
     private var started = false
+    // When the agent is not approved, re-opening the workspace re-asks the
+    // user for approval. This timestamp throttles those re-opens so a batch
+    // of failing tool calls in one turn does not fire a prompt per call.
+    private var lastApprovalReopen: Date?
     // When true, every mcpbridge tool call (name, args, raw response) is
     // appended to ~/.terrapinpilot/logs/mcp_bridge.log for inspection.
     private let debugLog: Bool
@@ -304,6 +308,42 @@ public actor XcodeMCPBridgeClient: ToolProvider {
             }
         }
 
+        // 5. If Xcode reports the agent isn't approved to use its tools yet,
+        //    re-open the workspace: opening a project is what asks the user
+        //    to approve the agent, so this re-surfaces the approval prompt.
+        //    The cached identifiers belong to the pre-approval session and
+        //    are stale, so drop them and let the open response refresh them.
+        //    Retry the call once; if the user declines again the retried
+        //    result (still the approval message) is returned as-is.
+        if name != "XcodeOpenWorkspace", Self.isNotApproved(outputText) {
+            let cooldownElapsed = lastApprovalReopen.map { Date().timeIntervalSince($0) >= 30 } ?? true
+            if cooldownElapsed {
+                lastApprovalReopen = Date()
+                activeWorkspaceIdentifier = nil
+                openedWorkspacePath = nil
+
+                let openArgs: [String: Any] = ["path": cwd]
+                let openArgsJSON =
+                    (try? JSONSerialization.data(withJSONObject: openArgs))
+                    .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+                let openResult = await callTool(
+                    name: "XcodeOpenWorkspace",
+                    argsJSON: openArgsJSON,
+                    cwd: cwd
+                )
+                logger.debug("Approval re-open XcodeOpenWorkspace(\(cwd)): \(openResult)")
+
+                // callTool caches the identifier from the open response;
+                // inject the fresh one so the retry targets the re-opened
+                // workspace.
+                if let identifier = activeWorkspaceIdentifier {
+                    argsDict["workspaceIdentifier"] = identifier
+                }
+                let retryResponse = sendToolRPC(name: name, argsDict: argsDict)
+                return parseToolOutput(response: retryResponse, name: name)
+            }
+        }
+
         return outputText
     }
 
@@ -386,11 +426,20 @@ public actor XcodeMCPBridgeClient: ToolProvider {
     /// (which do start with "Error") and the JSON error payloads.
     static func isBridgeError(_ result: String) -> Bool {
         if result.starts(with: "Error") { return true }
+        if isNotApproved(result) { return true }
         guard
             let data = result.data(using: .utf8),
             let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return false }
         return (json["type"] as? String) == "error"
+    }
+
+    /// True when mcpbridge reports that the agent has not been approved to
+    /// use Xcode's tools yet. Xcode returns this as ordinary tool-result text
+    /// (not a JSON-RPC error), so without this check callers would treat a
+    /// refused write or delete as a success.
+    static func isNotApproved(_ result: String) -> Bool {
+        result.lowercased().contains("isn't approved to use xcode's tools")
     }
 
     /// Matches open window tabs directly against the pre-normalized `cwd`

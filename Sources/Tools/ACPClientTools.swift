@@ -479,9 +479,22 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
             case .error(let message):
                 throw ACPError.message("Error reading text file \(path): message \(message)")
             }
-        } catch ACPError.message(let reason) {
-            return reason
         } catch {
+            // The client could not answer (timeout, error, ...). The agent
+            // runs on the same machine as the workspace, so fall back to
+            // the local disk when the file exists there.
+            if let local = Self.readLocalTextFile(path, line: args["line"] as? Int, limit: args["limit"] as? Int) {
+                Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "completed", sendJSON: sendJSON)
+                return local
+            }
+            
+            // Without a terminal update the client's tool-call spinner
+            // would spin forever, so always close the call out.
+            Self.sendToolCallUpdate(sessionId: sessionId, callId: callId, status: "failed", sendJSON: sendJSON)
+            
+            if case ACPError.message(let reason) = error {
+                return reason
+            }
             return "Other error reading text file: \(error.localizedDescription)"
         }
     }
@@ -1204,6 +1217,23 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
         }
     }
     
+    /// Reads a file directly from the local disk, applying the same 1-based
+    /// `line` / `limit` window the ACP client read would apply. Returns nil
+    /// when the file does not exist or is not valid UTF-8. Used as a
+    /// fallback when the client cannot answer (timeout, error, ...), since
+    /// the agent runs on the same machine as the workspace.
+    private static func readLocalTextFile(_ path: String, line: Int?, limit: Int?) -> String? {
+        guard FileManager.default.fileExists(atPath: path),
+              let content = try? String(contentsOfFile: path, encoding: .utf8)
+        else { return nil }
+        
+        let lines = content.components(separatedBy: "\n")
+        let start = max((line ?? 1) - 1, 0)
+        guard start < lines.count else { return "" }
+        let end = limit.map { min(start + max($0, 0), lines.count) } ?? lines.count
+        return lines[start..<end].joined(separator: "\n")
+    }
+    
     private func internalReadTextFile(clientChannel: ClientChannel, sessionId: String, path: String) async throws -> String {
         do {            
             do {
@@ -1224,8 +1254,8 @@ public final class ACPClientTools: ToolProvider, @unchecked Sendable {
                 throw error
             }
         } catch {
-            if FileManager.default.fileExists(atPath: path) {
-                return try String(contentsOfFile: path, encoding: .utf8)
+            if let local = Self.readLocalTextFile(path, line: nil, limit: nil) {
+                return local
             }
             throw error
         }

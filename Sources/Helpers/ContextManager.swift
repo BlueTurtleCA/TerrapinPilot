@@ -26,18 +26,43 @@ public struct ContextManager {
         return Int(Double(totalChars) / 3.5)
     }
 
+    /// The outcome of a history compaction: the compacted message list plus
+    /// stats describing what was dropped, for reporting to the client.
+    public struct CompactionResult: Sendable {
+        /// The history to use going forward (identical to the input when
+        /// `compacted` is false).
+        public let messages: [ChatMessage]
+        /// Whether any original messages were dropped.
+        public let compacted: Bool
+        /// Number of original messages that were removed.
+        public let messagesRemoved: Int
+        /// Number of recent original messages kept in the window.
+        public let messagesKept: Int
+        /// Estimated token count of the history before compaction.
+        public let tokensBefore: Int
+        /// Estimated token count of the history after compaction.
+        public let tokensAfter: Int
+    }
+
     /// Safely truncates middle messages when token limit is approached
     public static func compactHistory(
         _ history: [ChatMessage],
         maxTokens: Int = 16384,  // Set to your model's context size (e.g. 8192, 16384, 32768)
         targetBudgetRatio: Double = 0.90  // Compact when usage exceeds 90% of max context
-    ) -> [ChatMessage] {
+    ) -> CompactionResult {
         let currentTokens = estimateTokenCount(history)
         let tokenLimit = Int(Double(maxTokens) * targetBudgetRatio)
 
         // Return untouched if within context budget
         guard currentTokens > tokenLimit, history.count > 4 else {
-            return history
+            return CompactionResult(
+                messages: history,
+                compacted: false,
+                messagesRemoved: 0,
+                messagesKept: history.count,
+                tokensBefore: currentTokens,
+                tokensAfter: currentTokens
+            )
         }
 
         let systemMessage = history.first { $0.role == "system" }
@@ -84,7 +109,25 @@ public struct ContextManager {
         }
 
         compacted.append(contentsOf: recentMessages)
-        return compacted
+
+        // Count the original messages that survived: the recent window, plus
+        // the system message when it was prepended rather than kept in the
+        // window (a mid-history system message can be in both).
+        var retained = recentMessages.count
+        if systemMessage != nil,
+            !recentMessages.contains(where: { $0.role == "system" })
+        {
+            retained += 1
+        }
+
+        return CompactionResult(
+            messages: compacted,
+            compacted: true,
+            messagesRemoved: history.count - retained,
+            messagesKept: recentMessages.count,
+            tokensBefore: currentTokens,
+            tokensAfter: estimateTokenCount(compacted)
+        )
     }
 
     /// Queries the AI server's endpoints to retrieve the loaded model's context window

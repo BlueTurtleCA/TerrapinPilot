@@ -30,6 +30,10 @@ final class ACPServer: Sendable {
     // Written once in handleInitialize (the first message the client sends)
     // and only read afterwards, so no locking is needed.
     private nonisolated(unsafe) var clientKind: ClientKind = .xcode
+    // Whether the client advertised the ACP `session.compaction` capability,
+    // which gates compaction_update notifications. Written once in
+    // handleInitialize and only read afterwards, so no locking is needed.
+    private nonisolated(unsafe) var supportsCompaction = false
     // Set once when the Xcode MCP bridge is started; the stdin loop is
     // sequential, so no locking is needed.
     private nonisolated(unsafe) var xcodeBridgeReady = false
@@ -140,6 +144,15 @@ final class ACPServer: Sendable {
                 terminal: (clientCapabilities?["terminal"] as? Bool) ?? false
             )
         )
+
+        // The client opts in to compaction_update notifications by
+        // advertising the session.compaction capability. Per the ACP spec the
+        // agent MUST NOT send them without it; we fall back to an agent
+        // message instead.
+        let sessionCaps = clientCapabilities?["session"] as? [String: Any]
+        supportsCompaction =
+            (sessionCaps?["compaction"] as? [String: Any]) != nil
+                || (sessionCaps?["compaction"] as? Bool) == true
 
         // Identify the connecting client (clientInfo is SHOULD-level in the
         // ACP spec) so the agent can pick the matching system prompt and
@@ -346,6 +359,7 @@ final class ACPServer: Sendable {
                 sessionId: sessionId,
                 cwd: cwd,
                 client: self.clientKind,
+                supportsCompaction: self.supportsCompaction,
                 tools: tools,
                 onChunk: { text in
                     self.sendChunk(sessionId: sessionId, text: text)

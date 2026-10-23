@@ -90,7 +90,7 @@ struct EstimateTokenCountTests {
 @Suite("compactHistory")
 struct CompactHistoryTests {
     @Test func emptyHistoryStaysEmpty() {
-        #expect(ContextManager.compactHistory([], maxTokens: 1000).isEmpty)
+        #expect(ContextManager.compactHistory([], maxTokens: 1000).messages.isEmpty)
     }
 
     @Test func withinBudgetReturnsHistoryUnchanged() {
@@ -103,14 +103,18 @@ struct CompactHistoryTests {
         ]
         // 500 tokens total, under the 900-token limit (1000 × 0.90)
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
-        expectSameMessages(result, history)
+        #expect(!result.compacted)
+        #expect(result.messagesRemoved == 0)
+        #expect(result.tokensBefore == result.tokensAfter)
+        expectSameMessages(result.messages, history)
     }
 
     @Test func fourOrFewerMessagesAreNeverCompacted() {
         let history = (0..<4).map { _ in message("user", chars: 3500) }
         // 4000 tokens, far over the limit, but the count guard (<= 4) wins
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
-        expectSameMessages(result, history)
+        #expect(!result.compacted)
+        expectSameMessages(result.messages, history)
     }
 
     @Test func compactionKeepsSystemMessageAndNoticePair() {
@@ -125,22 +129,29 @@ struct CompactHistoryTests {
         // 2600 tokens > 900 limit, 6 messages > 4
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 4)
-        #expect(result[0].role == "system")
-        #expect(result[0].content == history[0].content)
-        #expect(result[1].role == "user")
+        #expect(result.compacted)
+        #expect(result.messages.count == 4)
+        #expect(result.messages[0].role == "system")
+        #expect(result.messages[0].content == history[0].content)
+        #expect(result.messages[1].role == "user")
         #expect(
-            result[1].content
+            result.messages[1].content
                 == "System Note: Older conversation turns were compacted to stay within the context window limit."
         )
-        #expect(result[2].role == "assistant")
+        #expect(result.messages[2].role == "assistant")
         #expect(
-            result[2].content
+            result.messages[2].content
                 == "Understood. I will continue focusing on your latest commands using the existing workspace state."
         )
         // keepBudget is 500 tokens, so only the final 500-token message fits
-        #expect(result[3].role == "user")
-        #expect(result[3].content == history[5].content)
+        #expect(result.messages[3].role == "user")
+        #expect(result.messages[3].content == history[5].content)
+        // Stats: the 4 middle messages were dropped; the system message and
+        // the final message survived.
+        #expect(result.messagesRemoved == 4)
+        #expect(result.messagesKept == 1)
+        #expect(result.tokensBefore == 2600)
+        #expect(result.tokensAfter < result.tokensBefore)
     }
 
     @Test func compactionWithoutSystemMessageStartsWithNotice() {
@@ -150,11 +161,14 @@ struct CompactHistoryTests {
         // 2500 tokens > 900 limit
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 3)
-        #expect(result[0].role == "user")
-        #expect(result[0].content?.contains("compacted") == true)
-        #expect(result[1].role == "assistant")
-        #expect(result[2].content == history[4].content)
+        #expect(result.compacted)
+        #expect(result.messages.count == 3)
+        #expect(result.messages[0].role == "user")
+        #expect(result.messages[0].content?.contains("compacted") == true)
+        #expect(result.messages[1].role == "assistant")
+        #expect(result.messages[2].content == history[4].content)
+        #expect(result.messagesRemoved == 4)
+        #expect(result.messagesKept == 1)
     }
 
     @Test func multipleRecentMessagesAreKeptWhileBudgetAllows() {
@@ -169,9 +183,12 @@ struct CompactHistoryTests {
         // 1200 tokens > 900 limit; keepBudget is 500
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 5)
-        #expect(result[3].content == history[4].content)
-        #expect(result[4].content == history[5].content)
+        #expect(result.compacted)
+        #expect(result.messages.count == 5)
+        #expect(result.messages[3].content == history[4].content)
+        #expect(result.messages[4].content == history[5].content)
+        #expect(result.messagesRemoved == 3)
+        #expect(result.messagesKept == 2)
     }
 
     @Test func oversizedMostRecentMessageIsAlwaysKept() {
@@ -184,9 +201,12 @@ struct CompactHistoryTests {
         ]
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 4)
-        #expect(result[3].role == "assistant")
-        #expect(result[3].content?.count == 3500)
+        #expect(result.compacted)
+        #expect(result.messages.count == 4)
+        #expect(result.messages[3].role == "assistant")
+        #expect(result.messages[3].content?.count == 3500)
+        #expect(result.messagesRemoved == 3)
+        #expect(result.messagesKept == 1)
     }
 
     @Test func orphanedLeadingToolMessageIsStripped() {
@@ -201,9 +221,12 @@ struct CompactHistoryTests {
         // keepBudget 500 keeps [tool, assistant]; the leading tool is stripped
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 4)
-        #expect(result[3].role == "assistant")
-        #expect(result[3].content == history[5].content)
+        #expect(result.compacted)
+        #expect(result.messages.count == 4)
+        #expect(result.messages[3].role == "assistant")
+        #expect(result.messages[3].content == history[5].content)
+        #expect(result.messagesRemoved == 4)
+        #expect(result.messagesKept == 1)
     }
 
     @Test func multipleOrphanedToolMessagesAreStripped() {
@@ -218,9 +241,12 @@ struct CompactHistoryTests {
         // keepBudget 500 keeps [tool, tool, assistant]; both tools are stripped
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 4)
-        #expect(result[3].role == "assistant")
-        #expect(result[3].content == history[5].content)
+        #expect(result.compacted)
+        #expect(result.messages.count == 4)
+        #expect(result.messages[3].role == "assistant")
+        #expect(result.messages[3].content == history[5].content)
+        #expect(result.messagesRemoved == 4)
+        #expect(result.messagesKept == 1)
     }
 
     @Test func midHistorySystemMessageIsDuplicated() {
@@ -237,9 +263,14 @@ struct CompactHistoryTests {
         ]
         let result = ContextManager.compactHistory(history, maxTokens: 1000)
 
-        #expect(result.count == 5)
-        #expect(result[0].role == "system")
-        #expect(result[3].role == "system")
+        #expect(result.compacted)
+        #expect(result.messages.count == 5)
+        #expect(result.messages[0].role == "system")
+        #expect(result.messages[3].role == "system")
+        // The system message is in the recent window, so it is not counted
+        // twice: the first three messages were dropped.
+        #expect(result.messagesRemoved == 3)
+        #expect(result.messagesKept == 2)
     }
 }
 

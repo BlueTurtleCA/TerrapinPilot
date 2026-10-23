@@ -47,11 +47,15 @@ public struct Agent: Sendable {
     }
 
     /// Runs a full agent turn for `prompt` within `sessionId`.
+    /// `supportsCompaction` reflects whether the client advertised the ACP
+    /// `session.compaction` capability, which gates `compaction_update`
+    /// notifications.
     public func run(
         prompt: String,
         sessionId: String,
         cwd: String,
         client: ClientKind,
+        supportsCompaction: Bool,
         tools: [ToolDefinition],
         onChunk: @escaping @Sendable (String) -> Void,
         onThought: @escaping @Sendable (String) -> Void,
@@ -114,8 +118,19 @@ public struct Agent: Sendable {
 
             currentTurn += 1
 
-            // Compact history if approaching context window limit
-            history = ContextManager.compactHistory(history, maxTokens: contextWindow)
+            // Compact history if approaching context window limit, and tell
+            // the client when it happens (it is otherwise invisible).
+            let compaction = ContextManager.compactHistory(history, maxTokens: contextWindow)
+            history = compaction.messages
+            if compaction.compacted {
+                reportCompaction(
+                    compaction,
+                    sessionId: sessionId,
+                    supportsCompaction: supportsCompaction,
+                    onChunk: onChunk,
+                    onSendJSON: onSendJSON
+                )
+            }
 
             let response: LLMResponse
             do {
@@ -249,6 +264,74 @@ public struct Agent: Sendable {
 
         // Save updated history
         await sessionStore.saveHistory(history, for: sessionId)
+    }
+
+    // MARK: - Compaction Reporting
+
+    /// Notifies the client that history was compacted. Clients that
+    /// advertised the ACP `session.compaction` capability get a structured
+    /// `compaction_update` (stats in `_meta`) followed by a `usage_update`
+    /// with the post-compaction context usage. Other clients get a one-line
+    /// agent message, the fallback the spec sanctions.
+    private func reportCompaction(
+        _ compaction: ContextManager.CompactionResult,
+        sessionId: String,
+        supportsCompaction: Bool,
+        onChunk: @escaping @Sendable (String) -> Void,
+        onSendJSON: @escaping @Sendable ([String: Any]) -> Void
+    ) {
+        let freed = compaction.tokensBefore - compaction.tokensAfter
+        let summary = """
+            Compacted conversation: removed \(compaction.messagesRemoved) older messages (~\(Self.formatTokens(freed)) tokens); kept the most recent \(compaction.messagesKept) messages.
+            """
+
+        guard supportsCompaction else {
+            onChunk("ℹ️ \(summary)")
+            return
+        }
+
+        onSendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "compaction_update",
+                    "compactionId": "cmp_\(UUID().uuidString)",
+                    "status": "completed",
+                    "summary": [
+                        ["type": "text", "text": summary],
+                    ],
+                    "_meta": [
+                        "messagesRemoved": compaction.messagesRemoved,
+                        "messagesKept": compaction.messagesKept,
+                        "tokensBefore": compaction.tokensBefore,
+                        "tokensAfter": compaction.tokensAfter,
+                    ],
+                ],
+            ],
+        ])
+
+        // Report the post-compaction context usage so clients with a context
+        // meter can update. usage_update requires no client capability.
+        onSendJSON([
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": [
+                "sessionId": sessionId,
+                "update": [
+                    "sessionUpdate": "usage_update",
+                    "used": compaction.tokensAfter,
+                    "size": contextWindow,
+                ],
+            ],
+        ])
+    }
+
+    /// Formats a token count for user display (e.g. 61204 -> "61.2k").
+    private static func formatTokens(_ tokens: Int) -> String {
+        guard tokens >= 1000 else { return "\(tokens)" }
+        return String(format: "%.1fk", Double(tokens) / 1000)
     }
 
     // MARK: - Debug Replay
